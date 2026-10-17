@@ -3,7 +3,8 @@ import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
 import { loadConfig } from '../src/config.js';
-import { TeamBot } from '../src/bot.js';
+import { TeamBot, type WorkerOptions } from '../src/bot.js';
+import { registerCommands } from '../src/commands.js';
 import { Events, type Client, type Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 
@@ -51,12 +52,12 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[5]) {
+function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[5], options?: WorkerOptions) {
   vi.useFakeTimers();
   const router = new AudioRouter({ 1: config.bots[1].channelId, 2: config.bots[2].channelId, 3: config.bots[3].channelId }, config);
   let leaders = { 1: 'alice' as string | null, 2: null, 3: null };
   router.setLeaders(leaders);
-  const bot = new TeamBot(1, config, router, () => leaders, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction);
+  const bot = new TeamBot(1, config, router, () => leaders, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options);
   activeBots.push(bot);
   const voice = { channelId: config.bots[1].channelId, serverDeaf: false, serverMute: false };
   const states = new Map([['alice', { channelId: config.bots[1].channelId }], ['bob', { channelId: config.bots[1].channelId }]]);
@@ -262,5 +263,55 @@ describe('Discord lifecycle', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(mocks.join).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+describe('dynamic worker assignments', () => {
+  const options = (active = true): WorkerOptions => ({ workerId: 1, token: 'a', channelId: config.bots[1].channelId, active, onIdentity: vi.fn(async () => {}) });
+  it('serves commands while paused without joining voice', async () => {
+    const interaction = vi.fn();
+    const settings = options(false);
+    const { bot } = setup(interaction, settings);
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settings.onIdentity).toHaveBeenCalledExactlyOnceWith('bot1');
+    expect(registerCommands).toHaveBeenCalled();
+    expect(mocks.join).not.toHaveBeenCalled();
+    bot.client.emit(Events.InteractionCreate, { commandName: 'group' } as Interaction);
+    expect(interaction).toHaveBeenCalledOnce();
+  });
+  it('never joins voice before verifying the persisted bot identity', async () => {
+    const settings = options();
+    vi.mocked(settings.onIdentity).mockRejectedValueOnce(Object.assign(new Error('duplicate account'), { code: 'BOT_IDENTITY_CONFLICT' }));
+    const { bot } = setup(undefined, settings);
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mocks.join).not.toHaveBeenCalled();
+    expect(bot.status().lastError).toBe('BOT_IDENTITY_CONFLICT');
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('cancels pending voice work when the group is paused', async () => {
+    const { bot, guild, router } = setup(undefined, options());
+    let finish!: (value: never) => void;
+    vi.mocked(bot.client.guilds.fetch).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    bot.configure(1, router, () => ({ 1: 'alice', 2: null, 3: null }), config.bots[1].channelId, false);
+    finish(guild as never);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mocks.join).not.toHaveBeenCalled();
+    expect(bot.status().receiving).toBe(false);
+    expect(bot.status().gateway).toBe(true);
+  });
+  it('ignores errors emitted by a replaced connection', async () => {
+    const { bot, connection, router } = setup(undefined, options());
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    bot.configure(1, router, () => ({ 1: 'alice', 2: null, 3: null }), config.bots[1].channelId, false);
+    connection.emit('error', new Error('late error'));
+    expect(bot.status().lastError).toBeNull();
+    expect(bot.status().gateway).toBe(true);
   });
 });

@@ -12,7 +12,7 @@
     "migrate": "node --env-file-if-exists=.env dist/scripts/migrate.js",
     "commands:register": "node --env-file-if-exists=.env dist/scripts/register-commands.js",
     "test": "vitest run",
-    "test:integration": "vitest run tests/postgres.test.ts",
+    "test:integration": "vitest run tests/postgres.test.ts tests/relay-postgres.test.ts",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

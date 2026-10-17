@@ -149,3 +149,59 @@ describe('bounded jitter queue and mixing', () => {
     } finally { encoder.close(); decoder.close(); }
   });
 });
+
+describe('independent relay groups', () => {
+  function group(prefix: string) {
+    const ids = [1, 2, 3].map(index => `${prefix}${index}`);
+    const router = new AudioRouter<string>(Object.fromEntries(ids.map(id => [id, `channel-${id}`])), { jitterMs: 0, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, () => 0);
+    const outputs = new Map(ids.map(id => [id, { write: vi.fn(), reset: vi.fn(), setReady: vi.fn(), close: vi.fn() }]));
+    router.setLeaders(Object.fromEntries(ids.map(id => [id, `leader-${id}`])));
+    for (const id of ids) { router.attach(id, outputs.get(id)!); router.setTransport(id, true); }
+    const feed = (id: string, sample: number) => {
+      const epoch = router.beginSource(id, `leader-${id}`, `channel-${id}`, false)!;
+      router.push(id, epoch, pcm(sample));
+      return epoch;
+    };
+    return { router, outputs, ids, feed };
+  }
+  it('mixes six simultaneous leaders only inside their own group', () => {
+    const a = group('a');
+    const b = group('b');
+    a.ids.forEach((id, index) => a.feed(id, (index + 1) * 1000));
+    b.ids.forEach((id, index) => b.feed(id, (index + 1) * 100));
+    a.router.tick(); b.router.tick();
+    expect(a.outputs.get('a1')!.write.mock.calls[0]![0].readInt16LE()).toBe(2500);
+    expect(a.outputs.get('a2')!.write.mock.calls[0]![0].readInt16LE()).toBe(2000);
+    expect(b.outputs.get('b1')!.write.mock.calls[0]![0].readInt16LE()).toBe(250);
+    expect(b.outputs.get('b2')!.write.mock.calls[0]![0].readInt16LE()).toBe(200);
+    expect(a.router.beginSource('b1', 'leader-b1', 'channel-b1', false)).toBeUndefined();
+    expect(b.router.beginSource('a1', 'leader-a1', 'channel-a1', false)).toBeUndefined();
+  });
+  it('revokes late frames and closes only the paused group', () => {
+    const a = group('a');
+    const b = group('b');
+    const epoch = b.feed('b1', 200);
+    a.feed('a1', 1000);
+    for (const output of a.outputs.values()) output.reset.mockClear();
+    b.router.setLeaders({ b1: null, b2: 'leader-b2', b3: 'leader-b3' });
+    b.router.push('b1', epoch, pcm(300));
+    b.router.tick();
+    expect(b.outputs.get('b2')!.write.mock.calls.at(-1)![0]).toBeUndefined();
+    b.router.stop();
+    a.router.tick();
+    expect(a.outputs.get('a2')!.write.mock.calls.at(-1)![0].readInt16LE()).toBe(1000);
+    for (const output of a.outputs.values()) { expect(output.reset).not.toHaveBeenCalled(); expect(output.close).not.toHaveBeenCalled(); }
+    expect(b.router.isCurrent('b1', epoch)).toBe(false);
+  });
+  it('contains an output fault to the group timer', () => {
+    vi.useFakeTimers();
+    const fault = vi.fn();
+    const router = new AudioRouter<string>({ b1: 'channel-b1' }, { jitterMs: 0, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, undefined, fault);
+    router.attach('b1', { write: () => { throw new Error('output failed'); }, reset: vi.fn(), close: vi.fn(), setReady: vi.fn() });
+    router.setTransport('b1', true);
+    router.start();
+    vi.advanceTimersByTime(20);
+    expect(fault).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

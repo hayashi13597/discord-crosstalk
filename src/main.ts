@@ -1,22 +1,20 @@
 import { generateDependencyReport } from '@discordjs/voice';
+import { escapeMarkdown } from 'discord.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
-import { createPool, InstanceLease, migrate, PostgresLeaders } from './database.js';
-import { LeaderService } from './leaders.js';
-import { AudioRouter } from './audio/router.js';
+import { createPool, InstanceLease, migrate } from './database.js';
+import { PostgresRelays } from './relay-repository.js';
+import { RelayService } from './relays.js';
+import { RelayRuntime } from './runtime.js';
 import { createCodec } from './audio/codec.js';
 import { createCommandHandler } from './commands.js';
-import { TeamBot } from './bot.js';
-import { TEAMS, type Team } from './types.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger(config);
   const pool = createPool(config.databaseUrl);
   pool.on('error', error => log.error({ err: error }, 'PostgreSQL pool error'));
-  const router = new AudioRouter(Object.fromEntries(TEAMS.map(t => [t, config.bots[t].channelId])) as Record<Team, string>, config);
-  const repository = new PostgresLeaders(pool, config.guildId);
-  const bots: TeamBot[] = [];
+  const repository = new PostgresRelays(pool, config);
   let commands: ReturnType<typeof createCommandHandler> | undefined;
   let stopping: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
@@ -27,11 +25,9 @@ async function main(): Promise<void> {
       const forced = setTimeout(() => { log.fatal('Shutdown timed out'); process.exit(1); }, 12000);
       forced.unref();
       commands?.stop();
-      // Stop voice immediately, even while an in-flight DB command is finishing.
-      const closingBots = bots.map(bot => bot.stop());
-      router.stop();
-      await leaders.stop();
-      await Promise.allSettled(closingBots);
+      const closing = runtime.stop();
+      await relays.stop();
+      await closing;
       await lease.release();
       await pool.end();
       clearTimeout(forced);
@@ -44,15 +40,30 @@ async function main(): Promise<void> {
     void shutdown(1).catch(() => process.exit(1));
   };
   const lease = new InstanceLease(pool, config.guildId, fatal);
-  const leaders = new LeaderService(repository, snapshot => {
-    try {
-      router.setLeaders(snapshot);
-      // refresh must observe the just-committed snapshot, before LeaderService publishes it.
-      activeLeaders = snapshot;
-      for (const bot of bots) bot.refresh();
-    } catch (error) { fatal(error); throw error; }
-  }, fatal);
-  let activeLeaders = leaders.snapshot;
+  const runtime = new RelayRuntime(config, log, interaction => { void commands?.handle(interaction); },
+    (workerId, userId) => repository.identify(workerId, userId));
+  const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
+  commands = createCommandHandler({ config, relays, onError: error => log.error({ err: error }, 'Command failed'),
+    status: async groupId => {
+      const snapshot = relays.snapshot;
+      const lines = [`PostgreSQL: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`];
+      for (const group of snapshot.groups.filter(group => !groupId || group.id === groupId)) {
+        const teams = snapshot.teams.filter(team => team.groupId === group.id);
+        lines.push(`${escapeMarkdown(group.name)}: ${group.state}; ${teams.length} team${runtime.groupError(group.id) ? '; lỗi AUDIO_ERROR (pause/resume để thử lại)' : ''}`);
+        for (const team of teams) {
+          const state = runtime.workerStatus(team.workerId);
+          lines.push(`${team.legacySlot ? `Team ${team.legacySlot} ` : ''}<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${team.leaderId ? `<@${team.leaderId}>` : 'Chưa có'}; relay ${group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+        }
+      }
+      if (!groupId) {
+        for (const worker of config.workers.filter(worker => !snapshot.teams.some(team => team.workerId === worker.id))) {
+          const state = runtime.workerStatus(worker.id);
+          lines.push(`Bot ${worker.id}: ${worker.id <= 3 ? 'giữ cho team cũ' : 'trống'}; gateway ${state?.gateway ? 'OK' : 'offline'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+        }
+      }
+      return lines.join('\n');
+    },
+  });
   process.once('SIGTERM', () => { void shutdown(0).catch(fatal); });
   process.once('SIGINT', () => { void shutdown(0).catch(fatal); });
   process.on('uncaughtException', fatal);
@@ -65,24 +76,10 @@ async function main(): Promise<void> {
     if (stopping) return;
     await migrate(pool);
     if (stopping) return;
-    await leaders.initialize();
+    await relays.initialize();
     if (stopping) return;
-    for (const team of TEAMS) bots.push(new TeamBot(team, config, router, () => activeLeaders, log, interaction => {
-      if (team === 1 && interaction.isChatInputCommand()) void commands!.handle(interaction);
-    }));
-    commands = createCommandHandler({ config, leaders, onError: error => log.error({ err: error }, 'Command failed'),
-      status: async () => {
-        const databaseHealthy = await repository.healthy();
-        return [`PostgreSQL: ${databaseHealthy ? 'OK' : 'Không kết nối được'}`, ...bots.map(bot => {
-          const state = bot.status();
-          const leader = activeLeaders[bot.team];
-          return `Team ${bot.team}: gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}; channel ${state.channelId ? `<#${state.channelId}>` : '—'}; leader ${leader ? `<@${leader}>` : 'Chưa có'}; relay ${state.receiving ? 'sẵn sàng' : state.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state.lastError ? `; lỗi ${state.lastError}` : ''}`;
-        })].join('\n');
-      },
-    });
-    router.start();
-    for (const bot of bots) bot.start();
-    log.info('CrossTalk started; bot connections are supervised independently');
+    runtime.start();
+    log.info('CrossTalk started; relay groups and bot connections are supervised independently');
   } catch (error) {
     if (stopping) { await stopping; return; }
     log.fatal({ err: error }, 'Startup failed');
@@ -90,5 +87,4 @@ async function main(): Promise<void> {
   }
 }
 
-// Configuration errors report variable names, never their values.
 void main().catch(() => { console.error('CrossTalk could not start. Check required configuration and dependencies.'); process.exitCode = 1; });

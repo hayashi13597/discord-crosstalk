@@ -8,10 +8,10 @@ import { AudioRouter } from './audio/router.js';
 import { VoiceOutput } from './audio/output.js';
 import { registerCommands } from './commands.js';
 import { safeError } from './logger.js';
-import type { Leaders, Team } from './types.js';
+import type { Team } from './types.js';
 
-export interface BotStatus {
-  team: Team;
+export interface BotStatus<T = Team> {
+  team: T;
   gateway: boolean;
   voice: string;
   channelId: string | null;
@@ -34,7 +34,15 @@ async function deadline<T>(promise: Promise<T>, ms: number): Promise<T> {
   } finally { clearTimeout(timeout); }
 }
 
-export class TeamBot {
+export interface WorkerOptions {
+  workerId: number;
+  token: string;
+  channelId: string | null;
+  active: boolean;
+  onIdentity: (userId: string) => Promise<void>;
+}
+
+export class TeamBot<T extends string | number = Team> {
   private currentClient: Client;
   get client(): Client { return this.currentClient; }
   readonly output: VoiceOutput;
@@ -52,12 +60,34 @@ export class TeamBot {
   private gatewayReconnecting = false;
   private gatewayAbort?: AbortController;
 
-  constructor(readonly team: Team, private config: Config, private router: AudioRouter,
-    private getLeaders: () => Leaders, private log: Logger,
-    private onInteraction?: (interaction: Interaction) => void) {
+  private revision = 0;
+  private identified = false;
+  private get workerId(): number { return this.options?.workerId ?? Number(this.team); }
+  private get token(): string { return this.options?.token ?? this.config.bots[this.team as Team].token; }
+  private get channelId(): string | null { return this.options ? this.options.channelId : this.config.bots[this.team as Team].channelId; }
+  private get enabled(): boolean { return this.options ? this.options.active && this.channelId !== null : true; }
+
+  constructor(public team: T, private config: Config, private router: AudioRouter<T>,
+    private getLeaders: () => Record<T, string | null>, private log: Logger,
+    private onInteraction?: (interaction: Interaction) => void, private options?: WorkerOptions) {
     this.currentClient = this.createClient();
     this.output = new VoiceOutput(error => this.audioFault(error));
-    router.attach(team, this.output);
+    if (this.channelId) router.attach(team, this.output);
+  }
+
+  configure(team: T, router: AudioRouter<T>, getLeaders: () => Record<T, string | null>, channelId: string | null, active: boolean): void {
+    if (!this.options || this.stopped) return;
+    ++this.revision;
+    this.disable();
+    this.destroyConnection();
+    this.router.detach(this.team);
+    this.team = team;
+    this.router = router;
+    this.getLeaders = getLeaders;
+    this.options.channelId = channelId;
+    this.options.active = active;
+    if (channelId) router.attach(team, this.output);
+    this.schedule(0);
   }
 
   private createClient(): Client {
@@ -110,10 +140,12 @@ export class TeamBot {
     this.running = true;
     this.requested = false;
     let delay = 2000;
+    const revision = this.revision;
     try {
       await this.maintain();
       this.attempts = 0;
     } catch (error) {
+      if (this.stopped || revision !== this.revision) return;
       this.recordError(error);
       this.disable();
       this.destroyConnection();
@@ -149,7 +181,7 @@ export class TeamBot {
         this.gatewayStarted = true;
         login = Promise.resolve().then(async () => {
           if (this.stopped) return;
-          await client.login(this.config.bots[this.team].token);
+          await client.login(this.token);
           if (this.stopped || this.client !== client) await client.destroy();
         });
       }
@@ -164,32 +196,53 @@ export class TeamBot {
   }
 
   private async maintain(): Promise<void> {
+    const revision = this.revision;
+    const stale = () => this.stopped || revision !== this.revision;
     if (!this.gatewayReady()) {
       this.disable();
       this.destroyConnection();
       try { await this.connectGateway(); }
       catch (error) {
-        if (this.stopped) return;
+        if (stale()) return;
         // destroy() is terminal in discord.js: retries must use a fresh Client.
         const previous = this.client;
         this.currentClient = this.createClient();
         this.gatewayStarted = false;
+        this.identified = false;
         this.gatewayReconnecting = false;
         await previous.destroy();
         throw error;
       }
     }
-    if (this.stopped) return;
+    if (stale()) return;
     if (!this.gatewayReady()) return;
+    if (!this.identified) {
+      await this.options?.onIdentity(this.client.user!.id);
+      if (stale()) return;
+      this.identified = true;
+    }
+    if (this.workerId === 1 && !this.commandsRegistered && Date.now() >= this.commandRetryAt) {
+      try {
+        await registerCommands(this.token, this.config.guildId, this.client.application!.id);
+        this.commandsRegistered = true;
+        this.log.info('Guild slash commands registered on Bot 1');
+      } catch (error) {
+        this.recordError(error);
+        this.commandRetryAt = Date.now() + 30000;
+      }
+    }
+    if (stale()) return;
+    if (!this.enabled) { this.disable(); this.destroyConnection(); return; }
     const guild = await this.client.guilds.fetch(this.config.guildId);
-    const channel = await guild.channels.fetch(this.config.bots[this.team].channelId);
-    if (this.stopped) return;
-    if (channel?.type !== ChannelType.GuildVoice) throw new Error('Configured channel must be a regular guild voice channel');
+    if (stale()) return;
+    const channel = await guild.channels.fetch(this.channelId!);
+    if (stale()) return;
+    if (channel?.type !== ChannelType.GuildVoice) throw Object.assign(new Error('Configured channel must be a regular guild voice channel'), { code: 'INVALID_VOICE_CHANNEL' });
     const me = await guild.members.fetchMe();
-    if (this.stopped) return;
+    if (stale()) return;
     const permissions = channel.permissionsFor(me);
     if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
-      throw new Error('Missing View Channel, Connect or Speak permission');
+      throw Object.assign(new Error('Missing View Channel, Connect or Speak permission'), { code: 'MISSING_VOICE_PERMISSIONS' });
     }
     if (this.connection && (this.connection.state.status === VoiceConnectionStatus.Destroyed ||
       this.connection.joinConfig.channelId !== channel.id || (me.voice.channelId !== channel.id && this.connection.state.status === VoiceConnectionStatus.Ready))) {
@@ -200,10 +253,10 @@ export class TeamBot {
       const connection = joinVoiceChannel({ channelId: channel.id, guildId: guild.id,
         group: this.client.user!.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false, selfMute: false });
       this.connection = connection;
-      connection.on('error', error => this.audioFault(error));
+      connection.on('error', error => { if (this.connection === connection && !this.stopped) this.audioFault(error); });
       connection.on('stateChange', (_old, next) => {
         if (this.connection !== connection || this.stopped) return;
-        this.log.info({ team: this.team, state: next.status }, 'Voice connection changed');
+        this.log.info({ worker: this.workerId, team: this.team, state: next.status }, 'Voice connection changed');
         if (next.status !== VoiceConnectionStatus.Ready) this.disable();
         else this.refresh();
         this.schedule(0);
@@ -213,7 +266,7 @@ export class TeamBot {
     if (this.connection.state.status !== VoiceConnectionStatus.Ready) {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 20000);
     }
-    if (this.stopped) return;
+    if (stale()) return;
     const leaderId = this.getLeaders()[this.team];
     if (leaderId && !this.client.users.cache.has(leaderId)) {
       // A single-member fetch needs no Guild Members privileged intent.
@@ -221,32 +274,22 @@ export class TeamBot {
         if (!(error && typeof error === 'object' && 'code' in error && error.code === 10007)) throw error;
       });
     }
-    if (this.stopped) return;
+    if (stale()) return;
     this.lastError = null;
     this.refresh();
-    if (this.team === 1 && !this.commandsRegistered && Date.now() >= this.commandRetryAt) {
-      try {
-        await registerCommands(this.config.bots[1].token, this.config.guildId, this.client.application!.id);
-        this.commandsRegistered = true;
-        this.log.info('Guild slash commands registered on Bot 1');
-      } catch (error) {
-        this.recordError(error);
-        this.commandRetryAt = Date.now() + 30000;
-      }
-    }
   }
 
   refresh(): void {
     if (this.stopped) return;
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const ownVoice = guild?.members.me?.voice;
-    const ready = this.gatewayReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
-      ownVoice?.channelId === this.config.bots[this.team].channelId && !ownVoice.serverDeaf && !ownVoice.serverMute;
+    const ready = this.enabled && this.identified && this.gatewayReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
+      ownVoice?.channelId === this.channelId && !ownVoice.serverDeaf && !ownVoice.serverMute;
     this.router.setTransport(this.team, Boolean(ready));
     const userId = this.getLeaders()[this.team];
     const voice = userId ? guild?.voiceStates.cache.get(userId) : undefined;
     const user = userId ? this.client.users.cache.get(userId) : undefined;
-    const eligible = ready && userId && user && !user.bot && voice?.channelId === this.config.bots[this.team].channelId;
+    const eligible = ready && userId && user && !user.bot && voice?.channelId === this.channelId;
     if (!eligible) { this.stopCapture(); return; }
     if (this.capture?.userId === userId && this.router.isCurrent(this.team, this.capture.epoch)) return;
     this.stopCapture();
@@ -305,7 +348,7 @@ export class TeamBot {
   }
   private recordError(error: unknown): void {
     this.lastError = safeError(error);
-    this.log.warn({ team: this.team, err: error }, 'Bot operation failed');
+    this.log.warn({ worker: this.workerId, team: this.team, err: error }, 'Bot operation failed');
   }
   private audioFault(error: unknown): void {
     if (this.stopped) return;
@@ -315,13 +358,13 @@ export class TeamBot {
     this.schedule(1000);
   }
 
-  status(): BotStatus {
+  status(): BotStatus<T> {
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const leaderId = this.getLeaders()[this.team];
     return {
       team: this.team, gateway: this.gatewayReady(), voice: this.connection?.state.status ?? 'offline',
       channelId: guild?.members.me?.voice.channelId ?? null,
-      leaderPresent: Boolean(leaderId && guild?.voiceStates.cache.get(leaderId)?.channelId === this.config.bots[this.team].channelId),
+      leaderPresent: Boolean(leaderId && guild?.voiceStates.cache.get(leaderId)?.channelId === this.channelId),
       receiving: Boolean(this.capture && this.router.isCurrent(this.team, this.capture.epoch)), lastError: this.lastError,
     };
   }

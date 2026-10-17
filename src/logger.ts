@@ -1,10 +1,9 @@
 import pino, { type DestinationStream, type LoggerOptions } from 'pino';
 import type { Config } from './config.js';
-import { TEAMS } from './types.js';
 
 // Scrub secrets even when a dependency embeds them in an exception string or URL.
 export function createLogger(config: Config, destination?: DestinationStream) {
-  const secrets = [...TEAMS.map(t => config.bots[t].token), config.databaseUrl];
+  const secrets = [...config.workers.map(worker => worker.token), config.databaseUrl];
   const url = new URL(config.databaseUrl);
   if (url.password) secrets.push(url.password, decodeURIComponent(url.password));
   const options: LoggerOptions = {

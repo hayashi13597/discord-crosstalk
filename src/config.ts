@@ -2,6 +2,7 @@ import { TEAMS, type Team } from './types.js';
 
 export interface Config {
   guildId: string;
+  workers: { id: number; token: string }[];
   bots: Record<Team, { token: string; channelId: string }>;
   databaseUrl: string;
   adminRoleIds: string[];
@@ -34,6 +35,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }])) as Config['bots'];
   if (new Set(TEAMS.map(t => bots[t].token)).size !== 3) throw new Error('Bot tokens must be distinct');
   if (new Set(TEAMS.map(t => bots[t].channelId)).size !== 3) throw new Error('Voice channels must be distinct');
+  const workers = Object.keys(env).filter(key => /^BOT_TOKEN_[1-9]\d*$/.test(key) && env[key]?.trim())
+    .map(key => ({ id: Number(key.slice(10)), token: required(key) })).sort((a, b) => a.id - b.id);
+  if (workers.some(worker => !Number.isSafeInteger(worker.id))) throw new Error('Invalid worker ID');
+  if (new Set(workers.map(worker => worker.token)).size !== workers.length) throw new Error('Bot tokens must be distinct');
   const databaseUrl = required('DATABASE_URL');
   const url = new URL(databaseUrl);
   if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error('DATABASE_URL must use PostgreSQL');
@@ -47,7 +52,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const logLevel = env.LOG_LEVEL ?? 'info';
   if (!['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'].includes(logLevel)) throw new Error('Invalid LOG_LEVEL');
   return {
-    guildId: id('GUILD_ID'), bots, databaseUrl, adminRoleIds, jitterMs, maxQueueMs,
+    guildId: id('GUILD_ID'), bots, workers, databaseUrl, adminRoleIds, jitterMs, maxQueueMs,
     singleGain: number('SINGLE_SOURCE_GAIN', 1, 0, 2),
     mixGain: number('MIX_SOURCE_GAIN', 0.5, 0, 1), logLevel,
   };

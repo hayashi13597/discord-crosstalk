@@ -53,3 +53,28 @@ describe('database connection failure boundaries', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+describe('relay topology transaction boundaries', () => {
+  it('distinguishes an uncertain COMMIT from an audit write failure', async () => {
+    const { PostgresRelays } = await import('../src/relay-repository.js');
+    const { loadConfig } = await import('../src/config.js');
+    const config = loadConfig({
+      GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
+      VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
+      DATABASE_URL: 'postgresql://localhost/test',
+    });
+    for (const failing of ['INSERT INTO relay_audit', 'COMMIT']) {
+      const query = vi.fn(async (sql: string) => {
+        if (sql.startsWith(failing)) throw new Error('connection reset');
+        return { rows: [], rowCount: 0 };
+      });
+      const release = vi.fn();
+      const pool = { connect: async () => ({ query, release }) } as unknown as pg.Pool;
+      const operation = new PostgresRelays(pool, config).mutate({ kind: 'group.create', name: 'Bravo' }, 'admin');
+      if (failing === 'COMMIT') await expect(operation).rejects.toBeInstanceOf(CommitUncertainError);
+      else await expect(operation).rejects.not.toBeInstanceOf(CommitUncertainError);
+      expect(query).toHaveBeenCalledWith('ROLLBACK');
+      expect(release).toHaveBeenCalledOnce();
+    }
+  });
+});

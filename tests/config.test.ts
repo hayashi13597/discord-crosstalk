@@ -28,3 +28,15 @@ describe('configuration', () => {
     expect(safeError({ code: 'ECONNRESET' })).toBe('ECONNRESET');
   });
 });
+
+
+describe('worker pool configuration', () => {
+  it('supports extra workers without voice-channel environment variables', () => {
+    const result = loadConfig({ ...validEnv, BOT_TOKEN_6: 'new-f', BOT_TOKEN_4: 'new-d', BOT_TOKEN_5: 'new-e' });
+    expect(result.workers.map(worker => worker.id)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(result.bots[1].channelId).toBe(validEnv.VOICE_CHANNEL_ID_1);
+  });
+  it('rejects duplicate tokens across the entire pool', () => {
+    expect(() => loadConfig({ ...validEnv, BOT_TOKEN_4: validEnv.BOT_TOKEN_1 })).toThrow('distinct');
+  });
+});

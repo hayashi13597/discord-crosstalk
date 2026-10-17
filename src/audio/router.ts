@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import { emptyLeaders, TEAMS, type Leaders, type Team } from '../types.js';
+import type { Team } from '../types.js';
 
 export const FRAME_MS = 20;
 export const FRAME_SAMPLES = 960;
@@ -60,56 +60,69 @@ export function mixFrames(frames: Buffer[], singleGain: number, mixGain: number)
 
 interface Source { userId: string; epoch: number; queue: FrameQueue; remainder: Buffer }
 
-export class AudioRouter {
-  private leaders: Leaders = emptyLeaders();
-  private available = new Set<Team>();
-  private sources = new Map<Team, Source>();
-  private epochs: Record<Team, number> = { 1: 0, 2: 0, 3: 0 };
-  private outputs = new Map<Team, Output>();
+export class AudioRouter<T extends string | number = Team> {
+  private teamIds: T[];
+  private leaders: Record<T, string | null>;
+  private available = new Set<T>();
+  private sources = new Map<T, Source>();
+  private epochs = new Map<T, number>();
+  private outputs = new Map<T, Output>();
   private timer?: NodeJS.Timeout;
   private lastTick?: number;
 
-  constructor(private channels: Record<Team, string>, private settings: AudioSettings,
-    private clock: () => number = () => performance.now()) {}
+  constructor(private channels: Record<T, string>, private settings: AudioSettings,
+    private clock: () => number = () => performance.now(), private onFault?: (error: unknown) => void) {
+    this.teamIds = Object.keys(channels).map(key => /^\d+$/.test(key) ? Number(key) : key) as T[];
+    this.leaders = Object.fromEntries(this.teamIds.map(team => [team, null])) as Record<T, string | null>;
+  }
 
-  attach(team: Team, output: Output): void { this.outputs.set(team, output); }
+  attach(team: T, output: Output): void {
+    if (!Object.hasOwn(this.channels, team)) throw new Error('Unknown team in router');
+    this.outputs.set(team, output);
+  }
 
-  setLeaders(leaders: Leaders): void {
-    for (const team of TEAMS) if (this.leaders[team] !== leaders[team]) this.endSource(team);
+  detach(team: T): void {
+    this.setTransport(team, false);
+    this.outputs.delete(team);
+  }
+
+  setLeaders(leaders: Record<T, string | null>): void {
+    for (const team of this.teamIds) if (this.leaders[team] !== leaders[team]) this.endSource(team);
     this.leaders = { ...leaders };
   }
 
-  setTransport(team: Team, ready: boolean): void {
-    if (this.available.has(team) === ready) return;
+  setTransport(team: T, ready: boolean): void {
+    if (!Object.hasOwn(this.channels, team) || this.available.has(team) === ready) return;
     if (ready) this.available.add(team);
     else { this.available.delete(team); this.endSource(team); }
     this.outputs.get(team)?.setReady(ready);
   }
 
-  beginSource(team: Team, userId: string, channelId: string | null, isBot: boolean): number | undefined {
+  beginSource(team: T, userId: string, channelId: string | null, isBot: boolean): number | undefined {
     if (!this.available.has(team) || isBot || this.leaders[team] !== userId || channelId !== this.channels[team]) return undefined;
     const existing = this.sources.get(team);
     if (existing?.userId === userId) return existing.epoch;
     this.endSource(team);
-    const epoch = ++this.epochs[team];
+    const epoch = (this.epochs.get(team) ?? 0) + 1;
+    this.epochs.set(team, epoch);
     this.sources.set(team, { userId, epoch, queue: new FrameQueue(this.settings.jitterMs, this.settings.maxQueueMs), remainder: Buffer.alloc(0) });
     return epoch;
   }
 
-  isCurrent(team: Team, epoch: number): boolean {
+  isCurrent(team: T, epoch: number): boolean {
     const source = this.sources.get(team);
     return this.available.has(team) && source?.epoch === epoch && source.userId === this.leaders[team];
   }
 
-  endSource(team: Team, epoch?: number): void {
+  endSource(team: T, epoch?: number): void {
     if (epoch !== undefined && this.sources.get(team)?.epoch !== epoch) return;
     this.sources.delete(team);
-    ++this.epochs[team];
+    this.epochs.set(team, (this.epochs.get(team) ?? 0) + 1);
     // Mixed packets may already include the revoked voice: flush destination resources too.
-    for (const dest of TEAMS) if (dest !== team) this.outputs.get(dest)?.reset();
+    for (const dest of this.teamIds) if (dest !== team) this.outputs.get(dest)?.reset();
   }
 
-  push(team: Team, epoch: number, pcm: Buffer): void {
+  push(team: T, epoch: number, pcm: Buffer): void {
     if (!this.isCurrent(team, epoch)) return;
     const source = this.sources.get(team)!;
     // Opus can decode several frames per packet. Keep only a partial frame as remainder.
@@ -131,7 +144,7 @@ export class AudioRouter {
       for (const output of this.outputs.values()) output.reset();
     }
     this.lastTick = now;
-    const frames = new Map<Team, Buffer>();
+    const frames = new Map<T, Buffer>();
     for (const [team, source] of this.sources) {
       const frame = source.queue.take(now);
       if (frame) frames.set(team, frame);
@@ -143,7 +156,12 @@ export class AudioRouter {
   }
 
   start(): void {
-    this.timer ??= setInterval(() => this.tick(), FRAME_MS);
+    this.timer ??= setInterval(() => {
+      try { this.tick(); }
+      catch (error) {
+        try { this.stop(); } finally { this.onFault?.(error); }
+      }
+    }, FRAME_MS);
   }
   stop(): void {
     clearInterval(this.timer);
@@ -151,6 +169,10 @@ export class AudioRouter {
     this.sources.clear();
     this.available.clear();
     this.lastTick = undefined;
-    for (const output of this.outputs.values()) output.close();
+    let failure: unknown;
+    for (const output of this.outputs.values()) {
+      try { output.close(); } catch (error) { failure ??= error; }
+    }
+    if (failure && !this.onFault) throw failure;
   }
 }
