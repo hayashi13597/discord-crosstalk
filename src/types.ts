@@ -9,6 +9,8 @@ export function isTeam(value: number): value is Team {
 
 export class UserError extends Error {}
 
+export interface LeaderPresence { leaderIds: string[]; leadersKnown: boolean }
+
 export interface RelayGroup { id: string; name: string; state: 'active' | 'paused'; legacy: boolean }
 export interface RelayTeam {
   id: string; groupId: string; channelId: string; leaderId: string | null;

@@ -7,7 +7,7 @@ import { PostgresRelays } from './relay-repository.js';
 import { RelayService } from './relays.js';
 import { RelayRuntime } from './runtime.js';
 import { createCodec } from './audio/codec.js';
-import { createCommandHandler } from './commands.js';
+import { createCommandHandler, formatLeaders } from './commands.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   const runtime = new RelayRuntime(config, log, interaction => { void commands?.handle(interaction); },
     (workerId, userId) => repository.identify(workerId, userId));
   const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
-  commands = createCommandHandler({ config, relays, onError: error => log.error({ err: error }, 'Command failed'),
+  commands = createCommandHandler({ config, relays, leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
     status: async groupId => {
       const snapshot = relays.snapshot;
       const lines = [`PostgreSQL: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`];
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
         lines.push(`${escapeMarkdown(group.name)}: ${group.state}; ${teams.length} team${runtime.groupError(group.id) ? '; lỗi AUDIO_ERROR (pause/resume để thử lại)' : ''}`);
         for (const team of teams) {
           const state = runtime.workerStatus(team.workerId);
-          lines.push(`${team.legacySlot ? `Team ${team.legacySlot} ` : ''}<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${team.leaderId ? `<@${team.leaderId}>` : 'Chưa có'}; relay ${group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+          lines.push(`${team.legacySlot ? `Team ${team.legacySlot} ` : ''}<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${formatLeaders(state)}; relay ${group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
         }
       }
       if (!groupId) {

@@ -4,7 +4,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, escapeMarkdo
   type SlashCommandSubcommandBuilder } from 'discord.js';
 import type { Config } from './config.js';
 import type { RelayService } from './relays.js';
-import { isTeam, TEAMS, UserError, targetVersion, type RelayMutation, type RelaySnapshot, type RelayTeam } from './types.js';
+import { isTeam, TEAMS, UserError, targetVersion, type LeaderPresence, type RelayMutation, type RelaySnapshot, type RelayTeam } from './types.js';
 
 const groupOption = (sub: SlashCommandSubcommandBuilder, required = true) => sub.addStringOption(option => option
   .setName('group').setDescription('Relay group').setRequired(required).setAutocomplete(true));
@@ -25,10 +25,7 @@ export const commandDefinitions = [
     .addSubcommand(sub => channelOption(groupOption(sub.setName('add').setDescription('Thêm team vào group'))))
     .addSubcommand(sub => channelOption(sub.setName('remove').setDescription('Gỡ team sau khi xác nhận')))
     .addSubcommand(sub => groupOption(sub.setName('list').setDescription('Liệt kê teams của group'))),
-  new SlashCommandBuilder().setName('leader').setDescription('Quản lý leader CrossTalk')
-    .addSubcommand(sub => teamSelector(sub.setName('set').setDescription('Thêm hoặc thay leader')
-      .addUserOption(option => option.setName('user').setDescription('Leader mới').setRequired(true))))
-    .addSubcommand(sub => teamSelector(sub.setName('remove').setDescription('Gỡ leader sau khi xác nhận')))
+  new SlashCommandBuilder().setName('leader').setDescription('Xem leaders theo role CrossTalk')
     .addSubcommand(sub => groupOption(sub.setName('list').setDescription('Xem leaders; mặc định Group A'), false))
     .addSubcommand(sub => teamSelector(sub.setName('show').setDescription('Xem leader của một team'))),
   new SlashCommandBuilder().setName('status').setDescription('Xem trạng thái groups và bots'),
@@ -58,13 +55,19 @@ export function paginate(content: string): string[] {
   return pages;
 }
 
+export function formatLeaders(state: LeaderPresence | undefined): string {
+  if (!state?.leadersKnown) return 'Chưa xác minh (bot offline hoặc đang đồng bộ)';
+  return state.leaderIds.length ? state.leaderIds.map(id => `<@${id}>`).join(', ') : 'Chưa có leader trong voice';
+}
+
 interface Dependencies {
   config: Config;
   relays: RelayService;
   status: (groupId?: string) => Promise<string>;
+  leaders: (team: RelayTeam) => LeaderPresence | undefined;
   onError: (error: unknown) => void;
 }
-export function createCommandHandler({ config, relays, status, onError }: Dependencies) {
+export function createCommandHandler({ config, relays, status, leaders, onError }: Dependencies) {
   let accepting = true;
   const pending = new Map<string, Pending>();
   const cleanup = () => {
@@ -160,13 +163,13 @@ export function createCommandHandler({ config, relays, status, onError }: Depend
         await admin(interaction);
         if (sub === 'create') {
           await relays.mutate({ kind: 'group.create', name: interaction.options.getString('name', true) }, interaction.user.id);
-          await respond(interaction, 'Đã tạo group paused. Thêm team và leader rồi dùng /group resume.');
+          await respond(interaction, 'Đã tạo group paused. Thêm team, gán role Leader cho thành viên rồi dùng /group resume.');
           return;
         }
         const group = groupFor(interaction, snapshot);
         if (sub === 'delete') {
           if (group.legacy) throw new UserError('Không được xóa Group A chứa ánh xạ team cũ.');
-          await confirm(interaction, { kind: 'group.delete', groupId: group.id, expected: targetVersion(snapshot, 'group', group.id) }, `Xóa group ${escapeMarkdown(group.name)} và toàn bộ team/leader trong group?`);
+          await confirm(interaction, { kind: 'group.delete', groupId: group.id, expected: targetVersion(snapshot, 'group', group.id) }, `Xóa group ${escapeMarkdown(group.name)} và toàn bộ team trong group?`);
         } else if (sub === 'pause' || sub === 'resume') {
           await relays.mutate({ kind: 'group.state', groupId: group.id, state: sub === 'pause' ? 'paused' : 'active' }, interaction.user.id);
           await respond(interaction, sub === 'pause' ? 'Đã tạm ngừng relay của group.' : 'Đã bật group; các bot sẽ kết nối lại. Xem /group info để kiểm tra.');
@@ -178,7 +181,7 @@ export function createCommandHandler({ config, relays, status, onError }: Depend
         await admin(interaction);
         if (sub === 'remove') {
           const team = teamFor(interaction, snapshot);
-          await confirm(interaction, { kind: 'team.remove', teamId: team.id, expected: targetVersion(snapshot, 'team', team.id) }, `Gỡ team <#${team.channelId}> cùng phân công leader?`);
+          await confirm(interaction, { kind: 'team.remove', teamId: team.id, expected: targetVersion(snapshot, 'team', team.id) }, `Gỡ team <#${team.channelId}> khỏi relay group?`);
         } else if (sub === 'add') {
           const group = groupFor(interaction, snapshot);
           const channelId = interaction.options.getChannel('channel', true).id;
@@ -191,27 +194,17 @@ export function createCommandHandler({ config, relays, status, onError }: Depend
       }
       if (sub === 'list') {
         const group = groupFor(interaction, snapshot, true);
-        const lines = snapshot.teams.filter(team => team.groupId === group.id).map(team => `${team.legacySlot ? `Team ${team.legacySlot}` : `<#${team.channelId}>`}: ${team.leaderId ? `<@${team.leaderId}>` : 'Chưa có leader'}`);
+        const lines = snapshot.teams.filter(team => team.groupId === group.id).map(team => `${team.legacySlot ? `Team ${team.legacySlot}` : `<#${team.channelId}>`}: ${formatLeaders(leaders(team))}`);
         await respond(interaction, `${escapeMarkdown(group.name)}\n${lines.join('\n') || 'Chưa có team.'}`);
         return;
       }
+      if (sub === 'set' || sub === 'remove') {
+        await respond(interaction, `Leader được xác định tự động theo role <@&${config.leaderRoleId}> (LEADER_ROLE_ID). Hãy thêm/gỡ role trên thành viên trong Discord.`);
+        return;
+      }
       const team = teamFor(interaction, snapshot);
-      if (sub === 'show') { await respond(interaction, `<#${team.channelId}>: ${team.leaderId ? `<@${team.leaderId}>` : 'Chưa có leader'}`); return; }
-      await admin(interaction);
-      if (sub === 'remove') {
-        await confirm(interaction, { kind: 'leader.change', teamId: team.id, userId: null, expected: targetVersion(snapshot, 'team', team.id) }, `Gỡ leader của <#${team.channelId}>? Team vẫn nghe leader khác trong group.`);
-      } else if (sub === 'set') {
-        const user = interaction.options.getUser('user', true);
-        let member;
-        try { member = await interaction.guild!.members.fetch({ user: user.id, force: true }); }
-        catch (error) {
-          if (error && typeof error === 'object' && 'code' in error && error.code === 10007) throw new UserError('Người được chọn không thuộc server này.');
-          throw error;
-        }
-        if (member.user.bot) throw new UserError('Không thể gán bot làm leader.');
-        await relays.mutate({ kind: 'leader.change', teamId: team.id, userId: user.id }, interaction.user.id);
-        await respond(interaction, `Đã gán <@${user.id}> làm leader của <#${team.channelId}>.${member.voice.channelId !== team.channelId ? ' Relay sẽ bắt đầu khi group active và leader vào đúng voice channel.' : ''}`);
-      } else throw new UserError('Lệnh không hợp lệ.');
+      if (sub === 'show') { await respond(interaction, `<#${team.channelId}>: ${formatLeaders(leaders(team))}`); return; }
+      throw new UserError('Lệnh không hợp lệ.');
     } catch (error) {
       if (!(error instanceof UserError)) onError(error);
       if (interaction.isAutocomplete()) { await interaction.respond([]).catch(onError); return; }

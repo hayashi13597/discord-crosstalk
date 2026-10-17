@@ -62,9 +62,9 @@ interface Source { userId: string; epoch: number; queue: FrameQueue; remainder: 
 
 export class AudioRouter<T extends string | number = Team> {
   private teamIds: T[];
-  private leaders: Record<T, string | null>;
+  private leaders = new Map<T, Set<string>>();
   private available = new Set<T>();
-  private sources = new Map<T, Source>();
+  private sources = new Map<T, Map<number, Source>>();
   private epochs = new Map<T, number>();
   private outputs = new Map<T, Output>();
   private timer?: NodeJS.Timeout;
@@ -73,7 +73,6 @@ export class AudioRouter<T extends string | number = Team> {
   constructor(private channels: Record<T, string>, private settings: AudioSettings,
     private clock: () => number = () => performance.now(), private onFault?: (error: unknown) => void) {
     this.teamIds = Object.keys(channels).map(key => /^\d+$/.test(key) ? Number(key) : key) as T[];
-    this.leaders = Object.fromEntries(this.teamIds.map(team => [team, null])) as Record<T, string | null>;
   }
 
   attach(team: T, output: Output): void {
@@ -86,9 +85,17 @@ export class AudioRouter<T extends string | number = Team> {
     this.outputs.delete(team);
   }
 
-  setLeaders(leaders: Record<T, string | null>): void {
-    for (const team of this.teamIds) if (this.leaders[team] !== leaders[team]) this.endSource(team);
-    this.leaders = { ...leaders };
+  setLeaders(leaders: Record<T, readonly string[]>): void {
+    for (const team of this.teamIds) this.setTeamLeaders(team, leaders[team] ?? []);
+  }
+
+  setTeamLeaders(team: T, userIds: readonly string[]): void {
+    if (!Object.hasOwn(this.channels, team)) return;
+    const eligible = new Set(userIds);
+    this.leaders.set(team, eligible);
+    for (const source of this.sources.get(team)?.values() ?? []) {
+      if (!eligible.has(source.userId)) this.endSource(team, source.epoch);
+    }
   }
 
   setTransport(team: T, ready: boolean): void {
@@ -99,32 +106,35 @@ export class AudioRouter<T extends string | number = Team> {
   }
 
   beginSource(team: T, userId: string, channelId: string | null, isBot: boolean): number | undefined {
-    if (!this.available.has(team) || isBot || this.leaders[team] !== userId || channelId !== this.channels[team]) return undefined;
-    const existing = this.sources.get(team);
-    if (existing?.userId === userId) return existing.epoch;
-    this.endSource(team);
+    if (!this.available.has(team) || isBot || !this.leaders.get(team)?.has(userId) || channelId !== this.channels[team]) return undefined;
+    const sources = this.sources.get(team) ?? new Map<number, Source>();
+    const existing = [...sources.values()].find(source => source.userId === userId);
+    if (existing) return existing.epoch;
     const epoch = (this.epochs.get(team) ?? 0) + 1;
     this.epochs.set(team, epoch);
-    this.sources.set(team, { userId, epoch, queue: new FrameQueue(this.settings.jitterMs, this.settings.maxQueueMs), remainder: Buffer.alloc(0) });
+    sources.set(epoch, { userId, epoch, queue: new FrameQueue(this.settings.jitterMs, this.settings.maxQueueMs), remainder: Buffer.alloc(0) });
+    this.sources.set(team, sources);
     return epoch;
   }
 
   isCurrent(team: T, epoch: number): boolean {
-    const source = this.sources.get(team);
-    return this.available.has(team) && source?.epoch === epoch && source.userId === this.leaders[team];
+    const source = this.sources.get(team)?.get(epoch);
+    return this.available.has(team) && Boolean(source && this.leaders.get(team)?.has(source.userId));
   }
 
   endSource(team: T, epoch?: number): void {
-    if (epoch !== undefined && this.sources.get(team)?.epoch !== epoch) return;
-    this.sources.delete(team);
-    this.epochs.set(team, (this.epochs.get(team) ?? 0) + 1);
+    const sources = this.sources.get(team);
+    if (!sources || (epoch !== undefined && !sources.has(epoch))) return;
+    if (epoch === undefined) sources.clear();
+    else sources.delete(epoch);
+    if (!sources.size) this.sources.delete(team);
     // Mixed packets may already include the revoked voice: flush destination resources too.
     for (const dest of this.teamIds) if (dest !== team) this.outputs.get(dest)?.reset();
   }
 
   push(team: T, epoch: number, pcm: Buffer): void {
     if (!this.isCurrent(team, epoch)) return;
-    const source = this.sources.get(team)!;
+    const source = this.sources.get(team)!.get(epoch)!;
     // Opus can decode several frames per packet. Keep only a partial frame as remainder.
     if (pcm.length > FRAME_BYTES * 6 || pcm.length % (CHANNELS * 2)) return;
     const combined = source.remainder.length ? Buffer.concat([source.remainder, pcm]) : pcm;
@@ -140,17 +150,19 @@ export class AudioRouter<T extends string | number = Team> {
   tick(): void {
     const now = this.clock();
     if (this.lastTick !== undefined && now - this.lastTick > this.settings.maxQueueMs) {
-      for (const source of this.sources.values()) { source.queue.clear(); source.remainder = Buffer.alloc(0); }
+      for (const sources of this.sources.values()) for (const source of sources.values()) {
+        source.queue.clear(); source.remainder = Buffer.alloc(0);
+      }
       for (const output of this.outputs.values()) output.reset();
     }
     this.lastTick = now;
-    const frames = new Map<T, Buffer>();
-    for (const [team, source] of this.sources) {
+    const frames: [T, Buffer][] = [];
+    for (const [team, sources] of this.sources) for (const source of sources.values()) {
       const frame = source.queue.take(now);
-      if (frame) frames.set(team, frame);
+      if (frame) frames.push([team, frame]);
     }
     for (const team of this.available) {
-      const incoming = [...frames].filter(([source]) => source !== team).map(([, pcm]) => pcm);
+      const incoming = frames.filter(([source]) => source !== team).map(([, pcm]) => pcm);
       this.outputs.get(team)?.write(mixFrames(incoming, this.settings.singleGain, this.settings.mixGain));
     }
   }

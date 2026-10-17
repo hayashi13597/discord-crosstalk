@@ -8,9 +8,9 @@ import { AudioRouter } from './audio/router.js';
 import { VoiceOutput } from './audio/output.js';
 import { registerCommands } from './commands.js';
 import { safeError } from './logger.js';
-import type { Team } from './types.js';
+import type { LeaderPresence, Team } from './types.js';
 
-export interface BotStatus<T = Team> {
+export interface BotStatus<T = Team> extends LeaderPresence {
   team: T;
   gateway: boolean;
   voice: string;
@@ -47,7 +47,9 @@ export class TeamBot<T extends string | number = Team> {
   get client(): Client { return this.currentClient; }
   readonly output: VoiceOutput;
   private connection?: VoiceConnection;
-  private capture?: Capture;
+  private captures = new Map<string, Capture>();
+  private membersReady = false;
+  private membershipRevision = 0;
   private timer?: NodeJS.Timeout;
   private running = false;
   private stopped = false;
@@ -68,14 +70,14 @@ export class TeamBot<T extends string | number = Team> {
   private get enabled(): boolean { return this.options ? this.options.active && this.channelId !== null : true; }
 
   constructor(public team: T, private config: Config, private router: AudioRouter<T>,
-    private getLeaders: () => Record<T, string | null>, private log: Logger,
+    private log: Logger,
     private onInteraction?: (interaction: Interaction) => void, private options?: WorkerOptions) {
     this.currentClient = this.createClient();
     this.output = new VoiceOutput(error => this.audioFault(error));
     if (this.channelId) router.attach(team, this.output);
   }
 
-  configure(team: T, router: AudioRouter<T>, getLeaders: () => Record<T, string | null>, channelId: string | null, active: boolean): void {
+  configure(team: T, router: AudioRouter<T>, channelId: string | null, active: boolean): void {
     if (!this.options || this.stopped) return;
     ++this.revision;
     this.disable();
@@ -83,7 +85,8 @@ export class TeamBot<T extends string | number = Team> {
     this.router.detach(this.team);
     this.team = team;
     this.router = router;
-    this.getLeaders = getLeaders;
+    this.membersReady = false;
+    ++this.membershipRevision;
     this.options.channelId = channelId;
     this.options.active = active;
     if (channelId) router.attach(team, this.output);
@@ -91,19 +94,24 @@ export class TeamBot<T extends string | number = Team> {
   }
 
   private createClient(): Client {
-    const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+    const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
       rest: { timeout: 15000 } });
     const active = () => this.currentClient === client && !this.stopped;
     const error = (error: Error) => { if (active()) this.recordError(error); };
     const disconnected = () => {
       if (!active()) return;
       this.gatewayReconnecting = true;
+      this.membersReady = false;
+      ++this.membershipRevision;
       this.disable();
       this.schedule(0);
     };
     const ready = () => {
       if (!active()) return;
       this.gatewayReconnecting = false;
+      this.membersReady = false;
+      ++this.membershipRevision;
+      this.disable();
       this.schedule(0);
     };
     client.on(Events.Error, error);
@@ -117,11 +125,39 @@ export class TeamBot<T extends string | number = Team> {
     client.on(Events.VoiceStateUpdate, (before, after) => {
       if (!active()) return;
       if (after.guild.id !== this.config.guildId) return;
-      const leaderId = this.getLeaders()[this.team];
-      if (after.id === leaderId || before.id === leaderId || after.id === this.client.user?.id) {
+      if (before.channelId === this.channelId || after.channelId === this.channelId || after.id === this.client.user?.id) {
+        ++this.membershipRevision;
+        if (after.channelId === this.channelId && !after.member) this.membersReady = false;
         this.refresh();
         this.schedule(0);
       }
+    });
+    client.on(Events.GuildMemberUpdate, (_before, member) => {
+      if (!active() || member.guild.id !== this.config.guildId) return;
+      if (member.voice.channelId === this.channelId || this.captures.has(member.id)) {
+        ++this.membershipRevision;
+        this.refresh();
+        this.schedule(0);
+      }
+    });
+    client.on(Events.GuildMemberRemove, member => {
+      if (!active() || member.guild.id !== this.config.guildId) return;
+      ++this.membershipRevision;
+      this.stopCapture(member.id);
+      this.refresh();
+    });
+    client.on(Events.GuildMemberAvailable, member => {
+      if (!active() || member.guild.id !== this.config.guildId || member.voice.channelId !== this.channelId) return;
+      ++this.membershipRevision;
+      this.refresh();
+      this.schedule(0);
+    });
+    client.on(Events.GuildRoleDelete, role => {
+      if (!active() || role.guild.id !== this.config.guildId || role.id !== this.config.leaderRoleId) return;
+      this.membersReady = false;
+      ++this.membershipRevision;
+      this.disable();
+      this.schedule(0);
     });
     return client;
   }
@@ -199,6 +235,7 @@ export class TeamBot<T extends string | number = Team> {
     const revision = this.revision;
     const stale = () => this.stopped || revision !== this.revision;
     if (!this.gatewayReady()) {
+      this.membersReady = false;
       this.disable();
       this.destroyConnection();
       try { await this.connectGateway(); }
@@ -232,9 +269,27 @@ export class TeamBot<T extends string | number = Team> {
       }
     }
     if (stale()) return;
-    if (!this.enabled) { this.disable(); this.destroyConnection(); return; }
+    if (!this.channelId) { this.disable(); this.destroyConnection(); return; }
     const guild = await this.client.guilds.fetch(this.config.guildId);
     if (stale()) return;
+    if (!this.membersReady) {
+      const membershipRevision = this.membershipRevision;
+      const role = await guild.roles.fetch(this.config.leaderRoleId, { force: true });
+      if (stale()) return;
+      if (!role || role.id === guild.id) throw Object.assign(new Error('LEADER_ROLE_ID must identify a role other than @everyone in this server'), { code: 'INVALID_LEADER_ROLE' });
+      // Refresh only voice occupants, including after gateway resume. Never relay from an unverified cache.
+      const occupants = [...guild.voiceStates.cache.values()].filter(voice => voice.channelId === this.channelId);
+      const verified = await Promise.allSettled(occupants.map(voice => guild.members.fetch({ user: voice.id, force: true }).catch(error => {
+        if (!(error && typeof error === 'object' && 'code' in error && error.code === 10007)) throw error;
+        guild.members.cache.delete(voice.id);
+      })));
+      if (stale()) return;
+      const failed = verified.find(result => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
+      if (membershipRevision !== this.membershipRevision || !this.gatewayReady()) { this.requested = true; return; }
+      this.membersReady = true;
+    }
+    if (!this.enabled) { this.disable(); this.destroyConnection(); this.lastError = null; return; }
     const channel = await guild.channels.fetch(this.channelId!);
     if (stale()) return;
     if (channel?.type !== ChannelType.GuildVoice) throw Object.assign(new Error('Configured channel must be a regular guild voice channel'), { code: 'INVALID_VOICE_CHANNEL' });
@@ -267,35 +322,40 @@ export class TeamBot<T extends string | number = Team> {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 20000);
     }
     if (stale()) return;
-    const leaderId = this.getLeaders()[this.team];
-    if (leaderId && !this.client.users.cache.has(leaderId)) {
-      // A single-member fetch needs no Guild Members privileged intent.
-      await guild.members.fetch(leaderId).catch(error => {
-        if (!(error && typeof error === 'object' && 'code' in error && error.code === 10007)) throw error;
-      });
-    }
-    if (stale()) return;
     this.lastError = null;
     this.refresh();
+  }
+
+  private eligibleLeaderIds(): string[] {
+    if (!this.channelId || !this.membersReady || !this.gatewayReady()) return [];
+    const guild = this.client.guilds.cache.get(this.config.guildId);
+    if (!guild) return [];
+    return [...guild.voiceStates.cache.values()].filter(voice => {
+      const member = guild.members.cache.get(voice.id);
+      return voice.channelId === this.channelId && member && !member.user.bot && member.roles.cache.has(this.config.leaderRoleId);
+    }).map(voice => voice.id).sort();
   }
 
   refresh(): void {
     if (this.stopped) return;
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const ownVoice = guild?.members.me?.voice;
-    const ready = this.enabled && this.identified && this.gatewayReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
+    const ready = this.enabled && this.identified && this.membersReady && this.gatewayReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
       ownVoice?.channelId === this.channelId && !ownVoice.serverDeaf && !ownVoice.serverMute;
     this.router.setTransport(this.team, Boolean(ready));
-    const userId = this.getLeaders()[this.team];
-    const voice = userId ? guild?.voiceStates.cache.get(userId) : undefined;
-    const user = userId ? this.client.users.cache.get(userId) : undefined;
-    const eligible = ready && userId && user && !user.bot && voice?.channelId === this.channelId;
-    if (!eligible) { this.stopCapture(); return; }
-    if (this.capture?.userId === userId && this.router.isCurrent(this.team, this.capture.epoch)) return;
-    this.stopCapture();
+    const leaderIds = ready ? this.eligibleLeaderIds() : [];
+    this.router.setTeamLeaders(this.team, leaderIds);
+    for (const userId of this.captures.keys()) if (!leaderIds.includes(userId)) this.stopCapture(userId);
+    for (const userId of leaderIds) this.startCapture(userId);
+  }
+
+  private startCapture(userId: string): void {
+    const current = this.captures.get(userId);
+    if (current && this.router.isCurrent(this.team, current.epoch)) return;
+    this.stopCapture(userId);
     // A destroyed receive stream remains in the receiver map until its asynchronous close event.
     if (this.connection!.receiver.subscriptions.get(userId)?.destroyed) { this.schedule(1000); return; }
-    const epoch = this.router.beginSource(this.team, userId, voice.channelId, user.bot);
+    const epoch = this.router.beginSource(this.team, userId, this.channelId, false);
     if (epoch === undefined) return;
     try {
       const codec = createCodec();
@@ -303,15 +363,15 @@ export class TeamBot<T extends string | number = Team> {
       try { stream = this.connection!.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } }); }
       catch (error) { codec.close(); throw error; }
       const capture: Capture = { userId, epoch, stream, codec };
-      this.capture = capture;
+      this.captures.set(userId, capture);
       stream.on('data', (packet: Buffer) => {
-        if (this.capture !== capture || !this.router.isCurrent(this.team, epoch)) return;
+        if (this.captures.get(userId) !== capture || !this.router.isCurrent(this.team, epoch)) return;
         try { this.router.push(this.team, epoch, codec.decode(packet)); }
         catch (error) { this.captureFault(capture, error); }
       });
       stream.on('error', error => this.captureFault(capture, error));
       stream.on('close', () => {
-        if (this.capture === capture) { this.stopCapture(); this.schedule(1000); }
+        if (this.captures.get(userId) === capture) { this.stopCapture(userId); this.schedule(1000); }
       });
     } catch (error) {
       this.router.endSource(this.team, epoch);
@@ -321,16 +381,20 @@ export class TeamBot<T extends string | number = Team> {
   }
 
   private captureFault(capture: Capture, error: unknown): void {
-    if (this.capture !== capture) return;
+    if (this.captures.get(capture.userId) !== capture) return;
     this.recordError(error);
-    this.stopCapture();
+    this.stopCapture(capture.userId);
     // Receiver removes its subscription on close; do not resubscribe in the same turn.
     this.schedule(1000);
   }
 
-  private stopCapture(): void {
-    const capture = this.capture;
-    this.capture = undefined;
+  private stopCapture(userId?: string): void {
+    if (userId === undefined) {
+      for (const id of this.captures.keys()) this.stopCapture(id);
+      return;
+    }
+    const capture = this.captures.get(userId);
+    this.captures.delete(userId);
     if (!capture) return;
     this.router.endSource(this.team, capture.epoch);
     capture.stream.destroy();
@@ -340,6 +404,7 @@ export class TeamBot<T extends string | number = Team> {
   private disable(): void {
     this.stopCapture();
     this.router.setTransport(this.team, false);
+    this.router.setTeamLeaders(this.team, []);
   }
   private destroyConnection(): void {
     const connection = this.connection;
@@ -360,12 +425,12 @@ export class TeamBot<T extends string | number = Team> {
 
   status(): BotStatus<T> {
     const guild = this.client.guilds.cache.get(this.config.guildId);
-    const leaderId = this.getLeaders()[this.team];
+    const leaderIds = this.eligibleLeaderIds();
     return {
       team: this.team, gateway: this.gatewayReady(), voice: this.connection?.state.status ?? 'offline',
       channelId: guild?.members.me?.voice.channelId ?? null,
-      leaderPresent: Boolean(leaderId && guild?.voiceStates.cache.get(leaderId)?.channelId === this.channelId),
-      receiving: Boolean(this.capture && this.router.isCurrent(this.team, this.capture.epoch)), lastError: this.lastError,
+      leaderIds, leadersKnown: this.membersReady && this.gatewayReady(), leaderPresent: leaderIds.length > 0,
+      receiving: [...this.captures.values()].some(capture => this.router.isCurrent(this.team, capture.epoch)), lastError: this.lastError,
     };
   }
 

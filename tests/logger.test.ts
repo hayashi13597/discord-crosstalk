@@ -4,7 +4,7 @@ import { loadConfig } from '../src/config.js';
 
 it('scrubs secrets in exception text and excludes audio resources from logs', () => {
   const config = loadConfig({
-    BOT_TOKEN_4: 'secret-extra-worker', GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'secret-token-1', BOT_TOKEN_2: 'secret-token-2', BOT_TOKEN_3: 'secret-token-3',
+    BOT_TOKEN_4: 'secret-extra-worker', GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'secret-token-1', BOT_TOKEN_2: 'secret-token-2', BOT_TOKEN_3: 'secret-token-3',
     VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
     DATABASE_URL: 'postgresql://user:private-password@localhost/test',
   });

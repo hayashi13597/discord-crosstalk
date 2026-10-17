@@ -8,7 +8,7 @@ import { PostgresRelays } from '../src/relay-repository.js';
 import { targetVersion, type RelayMutation, type RelaySnapshot } from '../src/types.js';
 
 const config = loadConfig({
-  GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
+  GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
   VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
   DATABASE_URL: 'postgresql://localhost/test',
 });

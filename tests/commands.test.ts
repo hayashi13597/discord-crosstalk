@@ -3,10 +3,10 @@ import { ChannelType, PermissionFlagsBits, type Interaction } from 'discord.js';
 import { commandDefinitions, createCommandHandler, paginate } from '../src/commands.js';
 import { loadConfig } from '../src/config.js';
 import { RelayService } from '../src/relays.js';
-import { UserError, type RelaySnapshot } from '../src/types.js';
+import { type LeaderPresence, type RelaySnapshot } from '../src/types.js';
 
 const env = {
-  GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
+  GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
   VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
   DATABASE_URL: 'postgresql://localhost/test',
 };
@@ -17,7 +17,7 @@ const initial: RelaySnapshot = {
     { id: 'b1', groupId: 'b', channelId: '123456789012345674', workerId: 4, leaderId: 'bob', legacySlot: null },
   ],
 };
-async function setup({ allowed = true, bot = false, role = false, command = 'leader', sub = 'set',
+async function setup({ allowed = true, bot = false, role = false, command = 'leader', sub = 'show',
   channel = null as string | null, team = 1 as number | null, group = null as string | null, guildId = env.GUILD_ID } = {}) {
   const config = loadConfig({ ...env, ADMIN_ROLE_IDS: role ? '123456789012345679' : '' });
   const mutate = vi.fn(async () => structuredClone(initial));
@@ -36,7 +36,10 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
   };
   const onError = vi.fn();
   const status = vi.fn(async (_id?: string) => 'healthy');
-  const handler = createCommandHandler({ config, relays, status, onError });
+  const leaders = vi.fn<(team: RelaySnapshot['teams'][number]) => LeaderPresence | undefined>(team => ({
+    leadersKnown: true, leaderIds: team.id === 'b1' ? ['carol', 'dave'] : [],
+  }));
+  const handler = createCommandHandler({ config, relays, status, leaders, onError });
   const run = () => handler.handle(interaction as unknown as Interaction);
   const button = (customId: string) => {
     const value = { ...interaction, customId, deferred: false, replied: false, isButton: () => true, isChatInputCommand: () => false,
@@ -44,7 +47,7 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
     return { value, run: () => handler.handle(value as unknown as Interaction) };
   };
   const confirmId = () => interaction.editReply.mock.calls.at(-1)![0].components[0].components[0].data.custom_id as string;
-  return { interaction, run, mutate, actor, fetch, member, onError, handler, relays, status, button, confirmId };
+  return { interaction, run, mutate, actor, fetch, member, onError, handler, relays, status, leaders, button, confirmId };
 }
 
 describe('multi-group slash commands', () => {
@@ -54,54 +57,62 @@ describe('multi-group slash commands', () => {
     expect(text).toContain('autocomplete');
     expect(text).toContain('channel');
     expect(text).toContain('team');
+    const leader = commandDefinitions.find(command => command.name === 'leader')!;
+    expect(leader.options!.map(option => option.name)).toEqual(['list', 'show']);
   });
   it('checks fresh permissions for mutations and refuses ordinary members', async () => {
-    const { run, fetch, mutate, interaction, actor } = await setup({ allowed: false });
+    const { run, fetch, mutate, interaction, actor } = await setup({ command: 'group', sub: 'create', allowed: false });
     await run();
     expect(fetch).toHaveBeenCalledWith({ user: 'admin', force: true });
     expect(actor.permissions.has).toHaveBeenCalledWith(PermissionFlagsBits.ManageGuild);
     expect(mutate).not.toHaveBeenCalled();
     expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Manage Server') }));
   });
-  it.each([{ allowed: true }, { allowed: false, role: true }])('keeps legacy team selectors %j', async options => {
+  it.each([{ allowed: true }, { allowed: false, role: true }])('keeps legacy team selectors for inspection %j', async options => {
     const { run, mutate, interaction } = await setup(options);
     await run();
-    expect(mutate).toHaveBeenCalledWith({ kind: 'leader.change', teamId: 'a1', userId: 'alice' }, 'admin');
-    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('đúng voice channel') }));
+    expect(mutate).not.toHaveBeenCalled();
+    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Chưa có leader trong voice') }));
   });
-  it('selects Group B by channel without modifying Group A', async () => {
-    const { run, mutate } = await setup({ team: null, channel: initial.teams[1]!.channelId });
-    await run();
-    expect(mutate).toHaveBeenCalledWith({ kind: 'leader.change', teamId: 'b1', userId: 'alice' }, 'admin');
-  });
-  it.each([{ bot: true }, { team: 4 }, { team: 3 }, { channel: initial.teams[1]!.channelId }, { team: null }, { guildId: 'wrong' }])('refuses invalid target/context %j', async options => {
-    const { run, mutate } = await setup(options);
+  it.each(['set', 'remove'])('redirects stale leader %s commands to Discord roles without database writes', async sub => {
+    const { run, mutate, fetch, interaction } = await setup({ sub, team: null, allowed: false });
     await run();
     expect(mutate).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('LEADER_ROLE_ID') }));
   });
-  it('rejects users outside the server and propagates safe duplicate-leader errors', async () => {
-    const missing = await setup();
-    missing.fetch.mockRejectedValueOnce(Object.assign(new Error('Unknown Member'), { code: 10007 }));
-    await missing.run();
-    expect(missing.mutate).not.toHaveBeenCalled();
-    const duplicate = await setup();
-    duplicate.mutate.mockRejectedValue(new UserError('Leader đã được phân công.'));
-    await duplicate.run();
-    expect(duplicate.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: 'Leader đã được phân công.' }));
+  it('shows all live leaders in Group B instead of persisted assignments', async () => {
+    const { run, mutate, interaction } = await setup({ team: null, channel: initial.teams[1]!.channelId });
+    await run();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('<@carol>, <@dave>') }));
+    expect(JSON.stringify(interaction.editReply.mock.calls)).not.toContain('<@bob>');
   });
-  it('requires confirmation and fresh permissions to remove a leader', async () => {
-    const state = await setup({ sub: 'remove' });
+  it('distinguishes unknown leader state from an empty channel', async () => {
+    const state = await setup();
+    state.leaders.mockReturnValue(undefined);
+    await state.run();
+    expect(state.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Chưa xác minh') }));
+  });
+  it.each([{ team: 4 }, { team: 3 }, { channel: initial.teams[1]!.channelId }, { team: null }, { guildId: 'wrong' }])('refuses invalid target/context %j', async options => {
+    const { run, mutate, interaction } = await setup(options);
+    await run();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(interaction.editReply.mock.calls.length + interaction.reply.mock.calls.length).toBe(1);
+  });
+  it('requires confirmation and fresh permissions to remove a team', async () => {
+    const state = await setup({ command: 'team', sub: 'remove', channel: initial.teams[0]!.channelId });
     await state.run();
     expect(state.mutate).not.toHaveBeenCalled();
     const click = state.button(state.confirmId());
     await click.run();
     expect(state.actor.permissions.has).toHaveBeenCalledTimes(2);
-    expect(state.mutate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'leader.change', teamId: 'a1', userId: null, expected: expect.any(String) }), 'admin');
+    expect(state.mutate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'team.remove', teamId: 'a1', expected: expect.any(String) }), 'admin');
     await click.run();
     expect(state.mutate).toHaveBeenCalledTimes(1);
   });
   it('rejects expired confirmations, other users, and revoked permissions', async () => {
-    const state = await setup({ sub: 'remove' });
+    const state = await setup({ command: 'team', sub: 'remove', channel: initial.teams[0]!.channelId });
     await state.run();
     const id = state.confirmId();
     const other = state.button(id);
@@ -117,7 +128,7 @@ describe('multi-group slash commands', () => {
     finally { now.mockRestore(); }
   });
   it('cancels deletion without mutating configuration', async () => {
-    const state = await setup({ sub: 'remove' });
+    const state = await setup({ command: 'team', sub: 'remove', channel: initial.teams[0]!.channelId });
     await state.run();
     await state.button(state.confirmId().replace('confirm', 'cancel')).run();
     expect(state.mutate).not.toHaveBeenCalled();
@@ -150,10 +161,10 @@ describe('multi-group slash commands', () => {
     const a = await setup({ sub: 'list', allowed: false });
     await a.run();
     expect(a.fetch).not.toHaveBeenCalled();
-    expect(a.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: 'Group A\nTeam 1: Chưa có leader' }));
+    expect(a.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: 'Group A\nTeam 1: Chưa có leader trong voice' }));
     const b = await setup({ sub: 'list', group: 'b', allowed: false });
     await b.run();
-    expect(b.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('<@bob>') }));
+    expect(b.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('<@carol>, <@dave>') }));
   });
   it.each([{ command: 'status', sub: '' }, { command: 'group', sub: 'info' }, { command: 'group', sub: 'list' }, { command: 'team', sub: 'list' }, { command: 'leader', sub: 'show' }])('allows inspection without mutation permissions %j', async options => {
     const state = await setup({ ...options, group: 'b', allowed: false });
@@ -181,7 +192,7 @@ describe('multi-group slash commands', () => {
     expect(paginate('x'.repeat(10000)).every(page => page.length <= 1800)).toBe(true);
   });
   it('hides persistence errors and rejects commands after shutdown', async () => {
-    const state = await setup();
+    const state = await setup({ command: 'group', sub: 'create' });
     state.mutate.mockRejectedValue(new Error('database secret/password'));
     await state.run();
     expect(state.onError).toHaveBeenCalled();

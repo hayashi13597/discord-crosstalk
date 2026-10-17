@@ -2,6 +2,7 @@ import { TEAMS, type Team } from './types.js';
 
 export interface Config {
   guildId: string;
+  leaderRoleId: string;
   workers: { id: number; token: string }[];
   bots: Record<Team, { token: string; channelId: string }>;
   databaseUrl: string;
@@ -52,7 +53,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const logLevel = env.LOG_LEVEL ?? 'info';
   if (!['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'].includes(logLevel)) throw new Error('Invalid LOG_LEVEL');
   return {
-    guildId: id('GUILD_ID'), bots, workers, databaseUrl, adminRoleIds, jitterMs, maxQueueMs,
+    guildId: id('GUILD_ID'), leaderRoleId: id('LEADER_ROLE_ID'), bots, workers, databaseUrl, adminRoleIds, jitterMs, maxQueueMs,
     singleGain: number('SINGLE_SOURCE_GAIN', 1, 0, 2),
     mixGain: number('MIX_SOURCE_GAIN', 0.5, 0, 1), logLevel,
   };

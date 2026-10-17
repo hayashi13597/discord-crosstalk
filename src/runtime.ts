@@ -18,7 +18,7 @@ export class RelayRuntime {
     identify: (workerId: number, userId: string) => Promise<void>) {
     this.idle = new AudioRouter<string>({}, config);
     for (const worker of config.workers) {
-      this.workers.set(worker.id, new TeamBot(`idle-${worker.id}`, config, this.idle, () => ({}), log,
+      this.workers.set(worker.id, new TeamBot(`idle-${worker.id}`, config, this.idle, log,
         worker.id === 1 ? onInteraction : undefined,
         { workerId: worker.id, token: worker.token, channelId: null, active: false, onIdentity: userId => identify(worker.id, userId) }));
     }
@@ -40,7 +40,7 @@ export class RelayRuntime {
       try {
         // Revoke before closing/replacing routers. Only this group is touched.
         for (const team of old.teams.filter(team => team.groupId === id)) {
-          this.workers.get(team.workerId)?.configure(`idle-${team.workerId}`, this.idle, () => ({}), null, false);
+          this.workers.get(team.workerId)?.configure(`idle-${team.workerId}`, this.idle, null, false);
         }
         this.groups.get(id)?.router.stop();
         this.groups.delete(id);
@@ -51,15 +51,13 @@ export class RelayRuntime {
         const router = new AudioRouter<string>(Object.fromEntries(teams.map(team => [team.id, team.channelId])), this.config, undefined,
           error => this.contain(id, error, old));
         this.groups.set(id, { signature: signature(group), router });
-        router.setLeaders(this.leaders(id));
-        for (const team of teams) this.workers.get(team.workerId)?.configure(team.id, router, () => this.leaders(id), team.channelId, group.state === 'active');
+        for (const team of teams) this.workers.get(team.workerId)?.configure(team.id, router, team.channelId, group.state === 'active');
         if (group.state === 'active') router.start();
       } catch (error) { this.contain(id, error, old); }
     }
-    // Leader-only updates leave connections, timers and other groups intact.
+    // Metadata updates leave connections, timers and other groups intact.
     for (const group of snapshot.groups) if (!changed.has(group.id)) {
       try {
-        this.groups.get(group.id)!.router.setLeaders(this.leaders(group.id));
         for (const team of snapshot.teams.filter(team => team.groupId === group.id)) this.workers.get(team.workerId)?.refresh();
       } catch (error) { this.contain(group.id, error, old); }
     }
@@ -76,14 +74,11 @@ export class RelayRuntime {
       return !owner || owner.groupId === id;
     }).map(team => team.workerId));
     for (const workerId of workers) {
-      try { this.workers.get(workerId)?.configure(`idle-${workerId}`, this.idle, () => ({}), null, false); }
+      try { this.workers.get(workerId)?.configure(`idle-${workerId}`, this.idle, null, false); }
       catch (error) { this.log.error({ group: id, worker: workerId, err: error }, 'Worker cleanup failed'); }
     }
   }
 
-  private leaders(groupId: string): Record<string, string | null> {
-    return Object.fromEntries(this.snapshot.teams.filter(team => team.groupId === groupId).map(team => [team.id, team.leaderId]));
-  }
   start(): void { for (const worker of this.workers.values()) worker.start(); }
   workerStatus(id: number): BotStatus<string> | undefined { return this.workers.get(id)?.status(); }
   groupError(id: string): string | null { return this.errors.get(id) ?? null; }

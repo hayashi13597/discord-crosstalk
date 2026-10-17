@@ -5,7 +5,7 @@ import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
 import { loadConfig } from '../src/config.js';
 import { TeamBot, type WorkerOptions } from '../src/bot.js';
 import { registerCommands } from '../src/commands.js';
-import { Events, type Client, type Interaction } from 'discord.js';
+import { Events, GatewayIntentBits, type Client, type Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 
 const mocks = vi.hoisted(() => ({ join: vi.fn(), enter: vi.fn(), codecClosed: vi.fn() }));
@@ -21,6 +21,7 @@ vi.mock('discord.js', async importOriginal => {
   const original = await importOriginal<typeof import('discord.js')>();
   const { EventEmitter } = await import('node:events');
   class MockClient extends EventEmitter {
+    constructor(public options: unknown) { super(); }
     ready = false;
     destroyed = false;
     user = { id: 'bot1' };
@@ -41,7 +42,7 @@ vi.mock('discord.js', async importOriginal => {
 });
 
 const config = loadConfig({
-  GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
+  GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
   VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
   DATABASE_URL: 'postgresql://localhost/test',
 });
@@ -52,17 +53,23 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[5], options?: WorkerOptions) {
+function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options?: WorkerOptions) {
   vi.useFakeTimers();
   const router = new AudioRouter({ 1: config.bots[1].channelId, 2: config.bots[2].channelId, 3: config.bots[3].channelId }, config);
-  let leaders = { 1: 'alice' as string | null, 2: null, 3: null };
-  router.setLeaders(leaders);
-  const bot = new TeamBot(1, config, router, () => leaders, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options);
+  const bot = new TeamBot(1, config, router, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options);
   activeBots.push(bot);
   const voice = { channelId: config.bots[1].channelId, serverDeaf: false, serverMute: false };
-  const states = new Map([['alice', { channelId: config.bots[1].channelId }], ['bob', { channelId: config.bots[1].channelId }]]);
+  const members = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, {
+    id, user: { bot: id === 'relay-bot' }, guild: { id: config.guildId },
+    voice: { channelId: config.bots[1].channelId },
+    roles: { cache: new Map(id === 'alice' || id === 'relay-bot' ? [[config.leaderRoleId, {}]] : []) },
+  }]));
+  const state = (id: string, channelId = config.bots[1].channelId) => ({ id, channelId, member: members.get(id)! });
+  const states = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, state(id)]));
   const me = { voice };
-  const guild = { id: config.guildId, members: { me, fetchMe: vi.fn(async () => me) },
+  const guild = { id: config.guildId, members: { me, cache: members, fetchMe: vi.fn(async () => me),
+      fetch: vi.fn(async ({ user }: { user: string }) => members.get(user)) },
+    roles: { fetch: vi.fn(async () => ({ id: config.leaderRoleId })) },
     channels: { fetch: vi.fn(async () => ({ id: config.bots[1].channelId, type: 2, permissionsFor: () => ({ has: () => true }) })) },
     voiceStates: { cache: states }, voiceAdapterCreator: vi.fn(),
   };
@@ -89,8 +96,20 @@ function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[5], options
     connection.emit('stateChange', old, connection.state);
     return connection;
   });
-  return { bot, router, states, guild, connection, subscribe, subscriptions, configureClient,
-    change(userId: string | null) { leaders = { ...leaders, 1: userId }; router.setLeaders(leaders); bot.refresh(); },
+  return { bot, router, states, state, members, guild, connection, subscribe, subscriptions, configureClient,
+    setRole(userId: string, enabled: boolean) {
+      const member = members.get(userId)!;
+      if (enabled) member.roles.cache.set(config.leaderRoleId, {});
+      else member.roles.cache.delete(config.leaderRoleId);
+      bot.client.emit(Events.GuildMemberUpdate, {} as never, member as never);
+    },
+    change(userId: string | null) {
+      for (const member of members.values()) {
+        member.roles.cache.clear();
+        if (member.id === userId) member.roles.cache.set(config.leaderRoleId, {});
+      }
+      bot.refresh();
+    },
   };
 }
 
@@ -192,7 +211,7 @@ describe('Discord lifecycle', () => {
     expect(client.listenerCount(Events.ClientReady)).toBe(1);
     expect(mocks.join).not.toHaveBeenCalled();
   });
-  it('joins with a separate connection group and captures only the assigned leader', async () => {
+  it('joins with a separate connection group and captures only human voice members with the leader role', async () => {
     const { bot, subscribe } = setup();
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
@@ -200,6 +219,152 @@ describe('Discord lifecycle', () => {
     expect(subscribe).toHaveBeenCalledOnce();
     expect(subscribe.mock.calls[0]![0]).toBe('alice');
     expect(bot.status().receiving).toBe(true);
+  });
+  it('subscribes to all human leaders and revokes just the member losing the role', async () => {
+    const { bot, setRole, subscribe, subscriptions, guild } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.client.options).toMatchObject({ intents: expect.arrayContaining([GatewayIntentBits.GuildMembers]) });
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: ['alice'] });
+    setRole('bob', true);
+    expect(bot.status().leaderIds).toEqual(['alice', 'bob']);
+    expect([...subscriptions.keys()].sort()).toEqual(['alice', 'bob']);
+    const alice = subscriptions.get('alice')!;
+    const bob = subscriptions.get('bob')!;
+    guild.roles.fetch.mockClear();
+    setRole('alice', false);
+    expect(alice.destroyed).toBe(true);
+    expect(bob.destroyed).toBe(false);
+    expect(bot.status().leaderIds).toEqual(['bob']);
+    expect(bot.status().receiving).toBe(true);
+    expect(subscribe).toHaveBeenCalledTimes(2);
+    expect(guild.roles.fetch).not.toHaveBeenCalled();
+    // Bots bearing the leader role were never captured.
+    expect(subscriptions.has('relay-bot')).toBe(false);
+    alice.emit('data', Buffer.alloc(4));
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('isolates decoder or stream failures to one speaker and retries it', async () => {
+    const { bot, setRole, subscriptions } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    setRole('bob', true);
+    const alice = subscriptions.get('alice')!;
+    const bob = subscriptions.get('bob')!;
+    alice.emit('error', new Error('receive failure'));
+    expect(alice.destroyed).toBe(true);
+    expect(bob.destroyed).toBe(false);
+    expect(bot.status().receiving).toBe(true);
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(subscriptions.get('alice')).not.toBe(alice);
+    expect(subscriptions.get('bob')).toBe(bob);
+  });
+  it('stops a leader moving out of the assigned channel while others continue', async () => {
+    const { bot, setRole, states, state, subscriptions, members } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    setRole('bob', true);
+    const alice = subscriptions.get('alice')!;
+    const bob = subscriptions.get('bob')!;
+    const next = state('alice', config.bots[2].channelId);
+    states.set('alice', next);
+    members.get('alice')!.voice.channelId = next.channelId;
+    bot.client.emit(Events.VoiceStateUpdate, state('alice') as never, { ...next, guild: { id: config.guildId } } as never);
+    expect(alice.destroyed).toBe(true);
+    expect(bob.destroyed).toBe(false);
+    expect(bot.status().leaderIds).toEqual(['bob']);
+  });
+  it('does not relay until role and membership verification completes', async () => {
+    const { bot, guild, subscribe } = setup();
+    let release!: () => void;
+    guild.members.fetch.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(guild.members.cache.get('alice')); }));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    bot.refresh();
+    expect(bot.status()).toMatchObject({ leadersKnown: false, leaderIds: [], receiving: false });
+    expect(subscribe).not.toHaveBeenCalled();
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('retries verification if a role changes while the initial fetch is pending', async () => {
+    const { bot, guild, setRole, subscribe } = setup();
+    let release!: () => void;
+    guild.members.fetch.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(guild.members.cache.get('alice')); }));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    setRole('alice', false);
+    release();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: [], receiving: false });
+  });
+  it('fails closed when verifying a voice member fails', async () => {
+    const { bot, guild, subscribe } = setup();
+    guild.members.fetch.mockRejectedValueOnce(new Error('temporary API failure'));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status()).toMatchObject({ leadersKnown: false, leaderIds: [], receiving: false });
+    expect(subscribe).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: ['alice'], receiving: true });
+  });
+  it('discards a stale member when Discord reports they have left the server', async () => {
+    const { bot, guild, subscribe } = setup();
+    guild.members.fetch.mockRejectedValueOnce(Object.assign(new Error('Unknown Member'), { code: 10007 }));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: [], receiving: false });
+  });
+  it('keeps leader eligibility when the role is renamed', async () => {
+    const { bot, subscriptions } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const alice = subscriptions.get('alice');
+    bot.client.emit(Events.GuildRoleUpdate, { id: config.leaderRoleId, name: 'Leader' } as never,
+      { id: config.leaderRoleId, name: 'Captain' } as never);
+    bot.refresh();
+    expect(subscriptions.get('alice')).toBe(alice);
+    expect(bot.status().leaderIds).toEqual(['alice']);
+  });
+  it('revalidates roles after gateway resume and never restarts a revoked speaker', async () => {
+    const { bot, guild, members, connection } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    bot.client.emit(Events.ShardReconnecting, 0);
+    expect(bot.status()).toMatchObject({ leadersKnown: false, leaderIds: [], receiving: false });
+    await vi.advanceTimersByTimeAsync(1);
+    // Simulate a role revoked while disconnected: REST refresh corrects the old cache.
+    guild.members.fetch.mockImplementation(async ({ user }) => {
+      const member = members.get(user)!;
+      if (user === 'alice') member.roles.cache.clear();
+      return member;
+    });
+    connection.state = { status: 'ready' };
+    bot.client.emit(Events.ShardResume, 0, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: [], receiving: false });
+  });
+  it('stops capture when the configured role is deleted and reports an invalid role', async () => {
+    const { bot, guild, subscriptions } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const alice = subscriptions.get('alice')!;
+    guild.roles.fetch.mockResolvedValue(null as never);
+    bot.client.emit(Events.GuildRoleDelete, { id: config.leaderRoleId, guild: { id: config.guildId } } as never);
+    expect(alice.destroyed).toBe(true);
+    expect(bot.status().receiving).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status()).toMatchObject({ leadersKnown: false, lastError: 'INVALID_LEADER_ROLE' });
+  });
+  it('rejects @everyone as the leader role', async () => {
+    const { bot, guild } = setup();
+    guild.roles.fetch.mockResolvedValue({ id: config.guildId });
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status().lastError).toBe('INVALID_LEADER_ROLE');
+    expect(mocks.join).not.toHaveBeenCalled();
   });
   it('replaces an ongoing capture synchronously and closes its decoder', async () => {
     const { bot, subscriptions, subscribe, change } = setup();
@@ -216,15 +381,15 @@ describe('Discord lifecycle', () => {
     expect(bot.status().receiving).toBe(false);
   });
   it('automatically resumes capture after the leader leaves and rejoins', async () => {
-    const { bot, states, subscribe } = setup();
+    const { bot, states, state, subscribe } = setup();
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
     states.delete('alice');
-    bot.client.emit(Events.VoiceStateUpdate, { id: 'alice' } as never, { id: 'alice', guild: { id: config.guildId } } as never);
+    bot.client.emit(Events.VoiceStateUpdate, state('alice') as never, { id: 'alice', channelId: null, guild: { id: config.guildId } } as never);
     expect(bot.status().receiving).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    states.set('alice', { channelId: config.bots[1].channelId });
-    bot.client.emit(Events.VoiceStateUpdate, { id: 'alice' } as never, { id: 'alice', guild: { id: config.guildId } } as never);
+    states.set('alice', state('alice'));
+    bot.client.emit(Events.VoiceStateUpdate, { id: 'alice', channelId: null } as never, { ...state('alice'), guild: { id: config.guildId } } as never);
     expect(bot.status().receiving).toBe(true);
     expect(subscribe).toHaveBeenCalledTimes(2);
   });
@@ -278,6 +443,7 @@ describe('dynamic worker assignments', () => {
     expect(settings.onIdentity).toHaveBeenCalledExactlyOnceWith('bot1');
     expect(registerCommands).toHaveBeenCalled();
     expect(mocks.join).not.toHaveBeenCalled();
+    expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: ['alice'], receiving: false });
     bot.client.emit(Events.InteractionCreate, { commandName: 'group' } as Interaction);
     expect(interaction).toHaveBeenCalledOnce();
   });
@@ -298,7 +464,7 @@ describe('dynamic worker assignments', () => {
     vi.mocked(bot.client.guilds.fetch).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    bot.configure(1, router, () => ({ 1: 'alice', 2: null, 3: null }), config.bots[1].channelId, false);
+    bot.configure(1, router, config.bots[1].channelId, false);
     finish(guild as never);
     await vi.advanceTimersByTimeAsync(1);
     expect(mocks.join).not.toHaveBeenCalled();
@@ -309,7 +475,7 @@ describe('dynamic worker assignments', () => {
     const { bot, connection, router } = setup(undefined, options());
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    bot.configure(1, router, () => ({ 1: 'alice', 2: null, 3: null }), config.bots[1].channelId, false);
+    bot.configure(1, router, config.bots[1].channelId, false);
     connection.emit('error', new Error('late error'));
     expect(bot.status().lastError).toBeNull();
     expect(bot.status().gateway).toBe(true);

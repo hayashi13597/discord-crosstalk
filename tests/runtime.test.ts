@@ -7,10 +7,10 @@ import type { RelaySnapshot } from '../src/types.js';
 const mocks = vi.hoisted(() => ({ workers: new Map<number, { configure: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> }>() }));
 vi.mock('../src/bot.js', () => ({ TeamBot: class {
   configure = vi.fn(); refresh = vi.fn(); start = vi.fn(); stop = vi.fn(async () => {}); status = vi.fn(() => ({}));
-  constructor(...args: unknown[]) { mocks.workers.set((args[6] as { workerId: number }).workerId, this); }
+  constructor(...args: unknown[]) { mocks.workers.set((args[5] as { workerId: number }).workerId, this); }
 } }));
 const config = loadConfig({
-  GUILD_ID: '123456789012345678', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
+  GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
   VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
   DATABASE_URL: 'postgresql://localhost/test',
 });
@@ -37,9 +37,9 @@ describe('group runtime reconciliation', () => {
     runtime.apply(snapshot);
     expect(vi.getTimerCount()).toBe(1);
     for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure).not.toHaveBeenCalled();
-    for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure).toHaveBeenLastCalledWith(`team-${id}`, expect.anything(), expect.any(Function), `channel-${id}`, false);
+    for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure).toHaveBeenLastCalledWith(`team-${id}`, expect.anything(), `channel-${id}`, false);
   });
-  it('updates leaders without rebuilding any worker connections', () => {
+  it('ignores legacy leader assignments without rebuilding any worker connections', () => {
     const { runtime, snapshot } = setup();
     snapshot.teams[3]!.leaderId = 'new-leader';
     runtime.apply(snapshot);
@@ -54,7 +54,7 @@ describe('group runtime reconciliation', () => {
     runtime.apply(snapshot);
     expect(vi.getTimerCount()).toBe(1);
     for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure).not.toHaveBeenCalled();
-    for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure).toHaveBeenCalledWith(`idle-${id}`, expect.anything(), expect.any(Function), null, false);
+    for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure).toHaveBeenCalledWith(`idle-${id}`, expect.anything(), null, false);
   });
   it('contains a group reconciliation failure without reconfiguring Group A', () => {
     const { runtime, snapshot } = setup();
