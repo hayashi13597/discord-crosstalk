@@ -1,4 +1,3 @@
-import { Events } from 'discord.js';
 import { generateDependencyReport } from '@discordjs/voice';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
@@ -68,7 +67,9 @@ async function main(): Promise<void> {
     if (stopping) return;
     await leaders.initialize();
     if (stopping) return;
-    for (const team of TEAMS) bots.push(new TeamBot(team, config, router, () => activeLeaders, log));
+    for (const team of TEAMS) bots.push(new TeamBot(team, config, router, () => activeLeaders, log, interaction => {
+      if (team === 1 && interaction.isChatInputCommand()) void commands!.handle(interaction);
+    }));
     commands = createCommandHandler({ config, leaders, onError: error => log.error({ err: error }, 'Command failed'),
       status: async () => {
         const databaseHealthy = await repository.healthy();
@@ -78,9 +79,6 @@ async function main(): Promise<void> {
           return `Team ${bot.team}: gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}; channel ${state.channelId ? `<#${state.channelId}>` : '—'}; leader ${leader ? `<@${leader}>` : 'Chưa có'}; relay ${state.receiving ? 'sẵn sàng' : state.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state.lastError ? `; lỗi ${state.lastError}` : ''}`;
         })].join('\n');
       },
-    });
-    bots[0]!.client.on(Events.InteractionCreate, interaction => {
-      if (interaction.isChatInputCommand()) void commands!.handle(interaction);
     });
     router.start();
     for (const bot of bots) bot.start();

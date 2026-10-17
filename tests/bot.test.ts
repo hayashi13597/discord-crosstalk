@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
 import { loadConfig } from '../src/config.js';
 import { TeamBot } from '../src/bot.js';
-import { Events } from 'discord.js';
+import { Events, type Client, type Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 
 const mocks = vi.hoisted(() => ({ join: vi.fn(), enter: vi.fn(), codecClosed: vi.fn() }));
@@ -20,14 +20,21 @@ vi.mock('discord.js', async importOriginal => {
   const original = await importOriginal<typeof import('discord.js')>();
   const { EventEmitter } = await import('node:events');
   class MockClient extends EventEmitter {
-    ready = true;
+    ready = false;
+    destroyed = false;
     user = { id: 'bot1' };
     application = { id: 'bot1' };
     users = { cache: new Map([['alice', { id: 'alice', bot: false }], ['bob', { id: 'bob', bot: false }]]) };
     guilds = { cache: new Map(), fetch: vi.fn() };
-    isReady() { return this.ready; }
-    async login() { this.ready = true; return 'token'; }
-    async destroy() { this.ready = false; }
+    isReady() { return !this.destroyed && this.ready; }
+    login = vi.fn(async () => {
+      if (!this.destroyed) {
+        this.ready = true;
+        this.emit(original.Events.ClientReady, this);
+      }
+      return 'token';
+    });
+    destroy = vi.fn(async () => { this.destroyed = true; this.ready = false; });
   }
   return { ...original, Client: MockClient };
 });
@@ -44,12 +51,12 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-function setup() {
+function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[5]) {
   vi.useFakeTimers();
   const router = new AudioRouter({ 1: config.bots[1].channelId, 2: config.bots[2].channelId, 3: config.bots[3].channelId }, config);
   let leaders = { 1: 'alice' as string | null, 2: null, 3: null };
   router.setLeaders(leaders);
-  const bot = new TeamBot(1, config, router, () => leaders, { info: vi.fn(), warn: vi.fn() } as unknown as Logger);
+  const bot = new TeamBot(1, config, router, () => leaders, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction);
   activeBots.push(bot);
   const voice = { channelId: config.bots[1].channelId, serverDeaf: false, serverMute: false };
   const states = new Map([['alice', { channelId: config.bots[1].channelId }], ['bob', { channelId: config.bots[1].channelId }]]);
@@ -58,8 +65,11 @@ function setup() {
     channels: { fetch: vi.fn(async () => ({ id: config.bots[1].channelId, type: 2, permissionsFor: () => ({ has: () => true }) })) },
     voiceStates: { cache: states }, voiceAdapterCreator: vi.fn(),
   };
-  bot.client.guilds.cache.set(config.guildId, guild as never);
-  vi.mocked(bot.client.guilds.fetch).mockResolvedValue(guild as never);
+  const configureClient = () => {
+    bot.client.guilds.cache.set(config.guildId, guild as never);
+    vi.mocked(bot.client.guilds.fetch).mockResolvedValue(guild as never);
+  };
+  configureClient();
   const subscriptions = new Map<string, PassThrough>();
   const subscribe = vi.fn((userId: string) => {
     const stream = new PassThrough({ objectMode: true });
@@ -78,12 +88,109 @@ function setup() {
     connection.emit('stateChange', old, connection.state);
     return connection;
   });
-  return { bot, router, states, guild, connection, subscribe, subscriptions,
+  return { bot, router, states, guild, connection, subscribe, subscriptions, configureClient,
     change(userId: string | null) { leaders = { ...leaders, 1: userId }; router.setLeaders(leaders); bot.refresh(); },
   };
 }
 
 describe('Discord lifecycle', () => {
+  it('logs in without destroying the client first', async () => {
+    const { bot } = setup();
+    expect(bot.status().gateway).toBe(false);
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.client.login).toHaveBeenCalledOnce();
+    expect(bot.client.destroy).not.toHaveBeenCalled();
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('waits for client readiness after login resolves before joining voice', async () => {
+    const { bot } = setup();
+    vi.spyOn(bot.client, 'login').mockResolvedValueOnce('token');
+    bot.start();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(mocks.join).not.toHaveBeenCalled();
+    expect(bot.client.login).toHaveBeenCalledOnce();
+    expect(bot.status().lastError).toBeNull();
+    Object.assign(bot.client, { ready: true });
+    bot.client.emit(Events.ClientReady, bot.client as Client<true>);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status().receiving).toBe(true);
+    expect(bot.client.listenerCount(Events.ClientReady)).toBe(1);
+  });
+  it('replaces a failed client and preserves interaction handling after retry', async () => {
+    const onInteraction = vi.fn();
+    const { bot, configureClient } = setup(onInteraction);
+    const previous = bot.client;
+    vi.spyOn(previous, 'login').mockImplementationOnce(async () => {
+      await previous.destroy(); // discord.js also destroys the client when login fails.
+      throw new Error('temporary gateway failure');
+    });
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.client).not.toBe(previous);
+    expect(bot.status().receiving).toBe(false);
+    configureClient();
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(bot.status().receiving).toBe(true);
+    expect(bot.client.login).toHaveBeenCalledOnce();
+    expect(bot.status().lastError).toBeNull();
+    const interaction = { id: 'interaction' } as Interaction;
+    previous.emit(Events.InteractionCreate, interaction);
+    bot.client.emit(Events.InteractionCreate, interaction);
+    expect(onInteraction).toHaveBeenCalledExactlyOnceWith(interaction);
+    previous.emit(Events.ShardReconnecting, 0);
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('waits for gateway resume without destroying the client or logging in again', async () => {
+    const { bot, connection, configureClient } = setup();
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const client = bot.client;
+    client.emit(Events.ShardReconnecting, 0);
+    expect(bot.status().gateway).toBe(false);
+    expect(bot.status().receiving).toBe(false);
+    bot.refresh();
+    expect(bot.status().receiving).toBe(false);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(client.login).toHaveBeenCalledOnce();
+    expect(client.destroy).not.toHaveBeenCalled();
+    expect(bot.status().lastError).toBeNull();
+    // The voice connection was torn down while waiting for the gateway.
+    connection.state = { status: 'ready' };
+    configureClient();
+    client.emit(Events.ShardResume, 0, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.client).toBe(client);
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('replaces a client that never becomes ready and retries with backoff', async () => {
+    const { bot, configureClient } = setup();
+    const previous = bot.client;
+    vi.spyOn(previous, 'login').mockResolvedValueOnce('token');
+    bot.start();
+    await vi.advanceTimersByTimeAsync(30001);
+    expect(previous.destroy).toHaveBeenCalled();
+    expect(previous.listenerCount(Events.ClientReady)).toBe(1);
+    expect(bot.client).not.toBe(previous);
+    expect(bot.client.login).not.toHaveBeenCalled();
+    configureClient();
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('cancels gateway readiness waits on shutdown without scheduling a retry', async () => {
+    const { bot } = setup();
+    vi.spyOn(bot.client, 'login').mockResolvedValueOnce('token');
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const client = bot.client;
+    await bot.stop();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.client).toBe(client);
+    expect(bot.status().lastError).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(client.listenerCount(Events.ClientReady)).toBe(1);
+    expect(mocks.join).not.toHaveBeenCalled();
+  });
   it('joins with a separate connection group and captures only the assigned leader', async () => {
     const { bot, subscribe } = setup();
     bot.start();

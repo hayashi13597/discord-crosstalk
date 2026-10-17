@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, ChannelType, PermissionFlagsBits } from 'discord.js';
+import { Client, Events, GatewayIntentBits, ChannelType, PermissionFlagsBits, type Interaction } from 'discord.js';
 import { entersState, EndBehaviorType, joinVoiceChannel, VoiceConnectionStatus,
   type AudioReceiveStream, type VoiceConnection } from '@discordjs/voice';
 import type { Logger } from 'pino';
@@ -35,7 +35,8 @@ async function deadline<T>(promise: Promise<T>, ms: number): Promise<T> {
 }
 
 export class TeamBot {
-  readonly client: Client;
+  private currentClient: Client;
+  get client(): Client { return this.currentClient; }
   readonly output: VoiceOutput;
   private connection?: VoiceConnection;
   private capture?: Capture;
@@ -47,19 +48,44 @@ export class TeamBot {
   private commandsRegistered = false;
   private commandRetryAt = 0;
   private lastError: string | null = null;
+  private gatewayStarted = false;
+  private gatewayReconnecting = false;
+  private gatewayAbort?: AbortController;
 
   constructor(readonly team: Team, private config: Config, private router: AudioRouter,
-    private getLeaders: () => Leaders, private log: Logger) {
-    this.client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
-      rest: { timeout: 15000 } });
+    private getLeaders: () => Leaders, private log: Logger,
+    private onInteraction?: (interaction: Interaction) => void) {
+    this.currentClient = this.createClient();
     this.output = new VoiceOutput(error => this.audioFault(error));
     router.attach(team, this.output);
-    this.client.on(Events.Error, error => this.recordError(error));
-    this.client.on(Events.ShardError, error => this.recordError(error));
-    this.client.on(Events.ShardDisconnect, () => this.disable());
-    this.client.on(Events.ShardReconnecting, () => this.disable());
-    this.client.on(Events.ClientReady, () => this.schedule(0));
-    this.client.on(Events.VoiceStateUpdate, (before, after) => {
+  }
+
+  private createClient(): Client {
+    const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+      rest: { timeout: 15000 } });
+    const active = () => this.currentClient === client && !this.stopped;
+    const error = (error: Error) => { if (active()) this.recordError(error); };
+    const disconnected = () => {
+      if (!active()) return;
+      this.gatewayReconnecting = true;
+      this.disable();
+      this.schedule(0);
+    };
+    const ready = () => {
+      if (!active()) return;
+      this.gatewayReconnecting = false;
+      this.schedule(0);
+    };
+    client.on(Events.Error, error);
+    client.on(Events.ShardError, error);
+    client.on(Events.ShardDisconnect, disconnected);
+    client.on(Events.ShardReconnecting, disconnected);
+    client.on(Events.ClientReady, ready);
+    client.on(Events.ShardReady, ready);
+    client.on(Events.ShardResume, ready);
+    client.on(Events.InteractionCreate, interaction => { if (active()) this.onInteraction?.(interaction); });
+    client.on(Events.VoiceStateUpdate, (before, after) => {
+      if (!active()) return;
       if (after.guild.id !== this.config.guildId) return;
       const leaderId = this.getLeaders()[this.team];
       if (after.id === leaderId || before.id === leaderId || after.id === this.client.user?.id) {
@@ -67,6 +93,7 @@ export class TeamBot {
         this.schedule(0);
       }
     });
+    return client;
   }
 
   start(): void { this.schedule(0); }
@@ -98,16 +125,62 @@ export class TeamBot {
     }
   }
 
+  private gatewayReady(): boolean {
+    return !this.gatewayReconnecting && this.client.isReady();
+  }
+
+  private async connectGateway(): Promise<void> {
+    const client = this.client;
+    const abort = new AbortController();
+    this.gatewayAbort = abort;
+    let checkReady!: () => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      checkReady = () => { if (this.gatewayReady()) resolve(); };
+      client.on(Events.ClientReady, checkReady);
+      client.on(Events.ShardReady, checkReady);
+      client.on(Events.ShardResume, checkReady);
+      abort.signal.addEventListener('abort', () => reject(new Error('Discord gateway wait cancelled')), { once: true });
+    });
+    try {
+      // login() can resolve before guilds are available. Register readiness listeners first.
+      // During a reconnect, let discord.js resume its existing session instead of logging in again.
+      let login = Promise.resolve();
+      if (!this.gatewayStarted) {
+        this.gatewayStarted = true;
+        login = Promise.resolve().then(async () => {
+          if (this.stopped) return;
+          await client.login(this.config.bots[this.team].token);
+          if (this.stopped || this.client !== client) await client.destroy();
+        });
+      }
+      await deadline(Promise.all([ready, login.then(checkReady)]), 30000);
+    } finally {
+      client.off(Events.ClientReady, checkReady);
+      client.off(Events.ShardReady, checkReady);
+      client.off(Events.ShardResume, checkReady);
+      abort.abort();
+      if (this.gatewayAbort === abort) this.gatewayAbort = undefined;
+    }
+  }
+
   private async maintain(): Promise<void> {
-    if (!this.client.isReady()) {
+    if (!this.gatewayReady()) {
       this.disable();
       this.destroyConnection();
-      await this.client.destroy();
-      try { await deadline(this.client.login(this.config.bots[this.team].token), 30000); }
-      catch (error) { await this.client.destroy(); throw error; }
+      try { await this.connectGateway(); }
+      catch (error) {
+        if (this.stopped) return;
+        // destroy() is terminal in discord.js: retries must use a fresh Client.
+        const previous = this.client;
+        this.currentClient = this.createClient();
+        this.gatewayStarted = false;
+        this.gatewayReconnecting = false;
+        await previous.destroy();
+        throw error;
+      }
     }
-    if (this.stopped) { await this.client.destroy(); return; }
-    if (!this.client.isReady()) throw new Error('Discord gateway is not ready');
+    if (this.stopped) return;
+    if (!this.gatewayReady()) return;
     const guild = await this.client.guilds.fetch(this.config.guildId);
     const channel = await guild.channels.fetch(this.config.bots[this.team].channelId);
     if (this.stopped) return;
@@ -167,7 +240,7 @@ export class TeamBot {
     if (this.stopped) return;
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const ownVoice = guild?.members.me?.voice;
-    const ready = this.client.isReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
+    const ready = this.gatewayReady() && this.connection?.state.status === VoiceConnectionStatus.Ready &&
       ownVoice?.channelId === this.config.bots[this.team].channelId && !ownVoice.serverDeaf && !ownVoice.serverMute;
     this.router.setTransport(this.team, Boolean(ready));
     const userId = this.getLeaders()[this.team];
@@ -246,7 +319,7 @@ export class TeamBot {
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const leaderId = this.getLeaders()[this.team];
     return {
-      team: this.team, gateway: this.client.isReady(), voice: this.connection?.state.status ?? 'offline',
+      team: this.team, gateway: this.gatewayReady(), voice: this.connection?.state.status ?? 'offline',
       channelId: guild?.members.me?.voice.channelId ?? null,
       leaderPresent: Boolean(leaderId && guild?.voiceStates.cache.get(leaderId)?.channelId === this.config.bots[this.team].channelId),
       receiving: Boolean(this.capture && this.router.isCurrent(this.team, this.capture.epoch)), lastError: this.lastError,
@@ -256,6 +329,7 @@ export class TeamBot {
   async stop(): Promise<void> {
     this.stopped = true;
     clearTimeout(this.timer);
+    this.gatewayAbort?.abort();
     this.disable();
     this.destroyConnection();
     this.output.close();
