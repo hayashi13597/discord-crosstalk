@@ -8,6 +8,10 @@ import { RelayService } from './relays.js';
 import { RelayRuntime } from './runtime.js';
 import { createCodec } from './audio/codec.js';
 import { createCommandHandler, formatLeaders } from './commands.js';
+import { PostgresVoiceMoves } from './voice-move-repository.js';
+import { VoiceMoveService } from './voice-moves.js';
+import { createMoveRest } from './voice-move-discord.js';
+import { createVoiceMoveHandler } from './voice-move-commands.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -16,6 +20,8 @@ async function main(): Promise<void> {
   pool.on('error', error => log.error({ err: error }, 'PostgreSQL pool error'));
   const repository = new PostgresRelays(pool, config);
   let commands: ReturnType<typeof createCommandHandler> | undefined;
+  let voiceCommands: ReturnType<typeof createVoiceMoveHandler> | undefined;
+  let retentionTimer: NodeJS.Timeout | undefined;
   let stopping: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
     if (code) process.exitCode = code;
@@ -25,6 +31,10 @@ async function main(): Promise<void> {
       const forced = setTimeout(() => { log.fatal('Shutdown timed out'); process.exit(1); }, 12000);
       forced.unref();
       commands?.stop();
+      clearInterval(retentionTimer);
+      // Stop new moves and finish/interrupt the current request before destroying
+      // Bot 1's gateway or closing the audit database.
+      await voiceCommands?.stop();
       const closing = runtime.stop();
       await relays.stop();
       await closing;
@@ -37,10 +47,20 @@ async function main(): Promise<void> {
   };
   const fatal = (error: unknown) => {
     log.fatal({ err: error }, 'Fatal error; disabling relay');
+    // Lease loss must revoke audio immediately, even if move/audit shutdown is waiting.
+    void runtime.stop().catch(() => {});
     void shutdown(1).catch(() => process.exit(1));
   };
   const lease = new InstanceLease(pool, config.guildId, fatal);
-  const runtime = new RelayRuntime(config, log, interaction => { void commands?.handle(interaction); },
+  const commandError = (error: unknown) => log.error({ err: error }, 'Command failed');
+  const moveRepository = new PostgresVoiceMoves(pool);
+  const moves = new VoiceMoveService(moveRepository, commandError);
+  voiceCommands = createVoiceMoveHandler({ guildId: config.guildId, service: moves,
+    rest: createMoveRest(config.bots[1].token), onError: commandError });
+  const runtime = new RelayRuntime(config, log, interaction => {
+    void commands?.handle(interaction);
+    void voiceCommands?.handle(interaction);
+  },
     (workerId, userId) => repository.identify(workerId, userId));
   const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
   commands = createCommandHandler({ config, relays, leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
@@ -76,6 +96,11 @@ async function main(): Promise<void> {
     if (stopping) return;
     await migrate(pool);
     if (stopping) return;
+    await moveRepository.recover(config.guildId);
+    await moveRepository.prune(config.guildId);
+    retentionTimer = setInterval(() => { void moveRepository.prune(config.guildId).catch(commandError); }, 86400000);
+    retentionTimer.unref();
+    if (stopping) { clearInterval(retentionTimer); return; }
     await relays.initialize();
     if (stopping) return;
     runtime.start();

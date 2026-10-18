@@ -52,7 +52,7 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
 
 describe('multi-group slash commands', () => {
   it('serializes valid command definitions with legacy selectors and group autocomplete', () => {
-    expect(commandDefinitions.map(command => command.name)).toEqual(['group', 'team', 'leader', 'status']);
+    expect(commandDefinitions.map(command => command.name)).toEqual(['group', 'team', 'leader', 'status', 'voice']);
     const text = JSON.stringify(commandDefinitions);
     expect(text).toContain('autocomplete');
     expect(text).toContain('channel');

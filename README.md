@@ -52,12 +52,33 @@ Chỉ Bot 1 đăng ký và xử lý commands. Gateway của Bot 1 vẫn hoạt �
 | `/leader list group:Bravo` | Tất cả leader đang trong voice của group; bỏ `group` để xem Group A |
 | `/leader show channel:<voice>` | Tất cả leader đang trong voice của một team |
 | `/status` | Tổng quan PostgreSQL, groups và tất cả workers |
+| `/voice move-all` | Bảng riêng tư chọn nhiều nguồn, một đích, xem trước và xác nhận chuyển người |
+| `/voice move-status job:<id>` | Xem tiến độ, tổng kết và kết quả từng người của một tác vụ |
 
 `/leader set` và `/leader remove` đã bỏ; nếu Discord còn lưu lệnh cũ, bot chỉ hướng dẫn thêm/gỡ role và không ghi database. `/leader show team:1` vẫn chọn đúng team gốc của Group A. Chọn **một** trong `team` hoặc `channel`. Nếu team gốc đã bị gỡ, số cũ báo không còn tồn tại và không được cấp lại cho team khác. Worker 1–3 được giữ cho các team gốc, kể cả khi team đó đã gỡ.
 
 Group được chọn từ autocomplete theo tên, truyền ID ổn định. Tên group dài 1–80 ký tự, duy nhất trong server, không phân biệt hoa/thường. Một channel chỉ thuộc một team; một worker chỉ phục vụ một channel; leader thuộc team theo voice channel hiện tại, không giới hạn số leader/team. Bot account có role Leader vẫn không được relay.
 
-Tất cả phản hồi ephemeral bằng tiếng Việt; kết quả dài có nút chuyển trang. Thành viên được dùng lệnh xem. Mutation yêu cầu **Manage Server / Manage Guild** (bao gồm Administrator) hoặc role trong `ADMIN_ROLE_IDS`; ứng dụng fetch lại quyền mỗi lần thay đổi. Xóa group/team yêu cầu nút xác nhận trong **60 giây**, chỉ người chạy lệnh được xác nhận. Quyền và cấu hình mục tiêu được kiểm tra lại; nếu cấu hình đã đổi, chạy lại lệnh.
+Tất cả phản hồi ephemeral bằng tiếng Việt; kết quả dài có nút chuyển trang. Thành viên được dùng các lệnh xem relay. Thay đổi cấu hình relay yêu cầu **Manage Server / Manage Guild** (bao gồm Administrator) hoặc role trong `ADMIN_ROLE_IDS`; ứng dụng fetch lại quyền mỗi lần thay đổi. Xóa group/team yêu cầu nút xác nhận trong **60 giây**, chỉ người chạy lệnh được xác nhận. Quyền và cấu hình mục tiêu được kiểm tra lại; nếu cấu hình đã đổi, chạy lại lệnh.
+
+## Di chuyển hàng loạt người trong voice
+
+`/voice move-all` và `/voice move-status` yêu cầu **Move Members** cùng **Manage Guild** hoặc **Administrator**. `ADMIN_ROLE_IDS` không cấp quyền cho hai lệnh này. Cấp Bot 1 **View Channel**, **Connect**, **Move Members** trên mọi nguồn/đích được chọn; Connect tại nguồn còn dùng để xác minh voice state mới nhất qua Discord API. Không cần thêm bot/service, Message Content hay quyền Administrator cho bot.
+
+1. Mở `/voice move-all`, chọn 1–25 voice channel nguồn mỗi lượt rồi bấm **Thêm nguồn**. Lặp lại để tích lũy trên 25 nguồn; channel trùng được loại theo ID. Tổng số nguồn chịu giới hạn thực tế của guild và thời hạn phiên, không có trần nghiệp vụ 3 hoặc 25 nguồn.
+2. Chọn đúng một đích khác mọi nguồn. **Danh sách đã chọn** phân trang và cho xóa nguồn trên từng trang, kể cả channel đã bị xóa trên Discord. Có thể dùng menu nguồn với nút **Xóa nguồn**, hoặc **Xóa tất cả**.
+3. Bấm **Xem trước** để chụp snapshot người thật, số lượng mỗi nguồn và bot bị bỏ qua. Đích phải đủ chỗ cho toàn bộ snapshot, tính cả những người/bot đã ở đích. Không xác nhận khi nguồn toàn bot/trống, channel không hợp lệ hoặc thiếu quyền.
+4. **Xác nhận** trong 60 giây. Phiên chọn có hạn tuyệt đối 10 phút từ khi mở; preview không kéo dài thời hạn này. Quay lại/sửa lựa chọn yêu cầu snapshot mới. Hủy/hết hạn trước khi chạy không chuyển ai. Khi đã bắt đầu không có nút hủy hay undo.
+
+Mỗi guild chỉ có một job chạy. Chỉ người thuộc snapshot và vẫn trong một nguồn đã chọn ở lượt xử lý mới được chuyển; người mới vào không được thêm, người đã rời nguồn/ở đích được bỏ qua. Mọi bot account luôn bị bỏ qua. Leader và member được xử lý như nhau, không phụ thuộc Relay Group; leader rời channel team sẽ ngừng được thu theo logic relay hiện có. Không sửa mapping team/group/leader hoặc kết nối bot.
+
+Job xử lý tuần tự và cập nhật tiến độ tối đa mỗi 5 giây, sau đó tổng kết `Completed`, `Partially Completed`, `Failed` hoặc `Interrupted`. Từng người có kết quả `moved`, `skipped`, `failed`, hoặc `unknown` khi không xác định được Discord đã nhận thao tác hay chưa. Kết quả `unknown` được tính trong thất bại/chưa rõ, không tuyên bố đã chuyển thành công. Không rollback hay tự gửi lại yêu cầu có kết quả chưa rõ. Channel đầy trong lúc chạy được ghi nhận là thất bại; bot không cố vượt giới hạn dù có quyền quản trị.
+
+Migration `003` thêm `voice_move_jobs` và `voice_move_members`, lưu snapshot, người gọi/guild, nguồn/đích, thời gian và kết quả từng người. Phiên hủy/hết hạn được audit là `Cancelled`. Bản ghi kết thúc được giữ **90 ngày**, dọn khi khởi động và hằng ngày; job đang chạy không bị dọn. Không lưu interaction token, nội dung hội thoại hoặc audio. Xem lại bằng `/voice move-status job:<id>` với cùng quyền quản trị, kể cả sau restart hoặc khi webhook ephemeral hết hạn.
+
+Sau restart, job dang dở được đánh dấu `Interrupted` sau khi lấy instance lease; giữ kết quả đã lưu, đánh dấu lượt đang xử lý là `unknown` và các lượt chưa chạy là thất bại do gián đoạn. Không tự chạy lại. Quản trị viên đối chiếu trạng thái Discord/kết quả từng người trước khi mở tác vụ mới. Mất database trong lúc ghi kết quả dừng các lượt tiếp theo; nếu chưa thể ghi trạng thái kết thúc, job vẫn khóa guild cho tới khi phục hồi lúc restart.
+
+API không có thao tác nguyên tử “chỉ chuyển nếu user vẫn ở nguồn”: vẫn có khoảng đua giữa lần kiểm tra cuối và PATCH. Hàng đợi kiểm tra lại voice state trước mỗi lần gửi và sau thời gian chờ rate limit. Transport PATCH tắt retry cho timeout/5xx và trả 429 về worker để chờ theo Discord rồi kiểm tra lại, thay vì gửi lại mù quáng. Nguồn tham chiếu: [Modify Guild Member](https://docs.discord.com/developers/resources/guild#modify-guild-member), [Get User Voice State](https://docs.discord.com/developers/resources/voice#get-user-voice-state), [Rate Limits](https://docs.discord.com/developers/topics/rate-limits).
 
 ## Cấu hình và dữ liệu
 
@@ -131,5 +152,7 @@ Tự động kiểm tra migration từ schema cũ, mapping bền vững, cấp w
 - Thêm/gỡ role khi đang nói, leader chuyển channel/group hoặc rời/vào voice, pause/resume B: không phát audio cũ, A tiếp tục hoạt động.
 - Thử channel trùng, hết worker, thiếu quyền voice, bot B bị kick/move/mất kết nối: báo lỗi riêng và khôi phục đúng mapping.
 - Restart/redeploy giữ groups, trạng thái paused và bot assignments; leader được xác định lại theo role và voice channel. Thử rollback trên database sao chép trước khi dùng production.
+
+Mass Voice Move có unit/mocked tests cho nhiều lượt trên 25 nguồn, xóa/quay lại, snapshot, bot exclusion, quyền, hết hạn, bấm lặp, rate limit, lỗi từng người, mất gateway/audit và truy vấn kết quả. Integration PostgreSQL kiểm tra migration, job cạnh tranh, transaction, phục hồi và retention. Trước production, chạy đầy đủ **AC-01–AC-22** trong [đặc tả Mass Voice Move](specs/CALLER_MASS_VOICE_MOVE_SPEC.md) trên Discord test server, gồm hai relay group hoạt động, bot giữ nguyên vị trí, leader ngừng/tiếp tục relay đúng channel, đích đầy và restart giữa job. Chỉ đánh dấu đã nghiệm thu sau khi thực sự thực hiện trên Discord.
 
 Chưa bao gồm dashboard, nhiều server, ghi âm, tự chia team hoặc điều phối nhiều service. Không có Discord token production được cấu hình sẵn trong repository; chỉ xác nhận nghiệm thu voice/Railway sau khi thực sự chạy các bước này.

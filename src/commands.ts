@@ -29,6 +29,11 @@ export const commandDefinitions = [
     .addSubcommand(sub => groupOption(sub.setName('list').setDescription('Xem leaders; mặc định Group A'), false))
     .addSubcommand(sub => teamSelector(sub.setName('show').setDescription('Xem leader của một team'))),
   new SlashCommandBuilder().setName('status').setDescription('Xem trạng thái groups và bots'),
+  new SlashCommandBuilder().setName('voice').setDescription('Quản trị voice channels')
+    .setDefaultMemberPermissions(PermissionFlagsBits.MoveMembers | PermissionFlagsBits.ManageGuild)
+    .addSubcommand(sub => sub.setName('move-all').setDescription('Chọn nhiều nguồn và chuyển người sang một voice channel'))
+    .addSubcommand(sub => sub.setName('move-status').setDescription('Xem tiến độ và audit của tác vụ di chuyển')
+      .addStringOption(option => option.setName('job').setDescription('Job ID').setRequired(true).setMaxLength(36))),
 ].map(command => command.setDMPermission(false).toJSON());
 
 export async function registerCommands(token: string, guildId: string, applicationId?: string): Promise<void> {
