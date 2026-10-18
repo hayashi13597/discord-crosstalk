@@ -1,6 +1,7 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
+watchPatterns = ["/src/**", "/migrations/**", "/package.json", "/package-lock.json", "/tsconfig*.json", "/Dockerfile", "/.dockerignore", "/railway.toml"]
 
 [deploy]
 numReplicas = 1

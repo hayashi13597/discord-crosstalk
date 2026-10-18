@@ -154,4 +154,8 @@ Tự động kiểm tra migration từ schema cũ, mapping bền vững, cấp w
 
 Mass Voice Move có unit/mocked tests cho UI hai menu/hai nút, thay thế lựa chọn và tối đa 25 nguồn, snapshot khi xác nhận, bot exclusion, quyền, hết hạn, bấm lặp, dừng ngay khi rate limit/lỗi từng người/mất gateway/audit/tiến độ và truy vấn kết quả. Integration PostgreSQL kiểm tra migration, job cạnh tranh, transaction, phục hồi và retention. Trước production, chạy đầy đủ **AC-01–AC-22** trong [đặc tả Mass Voice Move](specs/CALLER_MASS_VOICE_MOVE_SPEC.md) trên Discord test server, gồm hai relay group hoạt động, bot giữ nguyên vị trí, leader ngừng/tiếp tục relay đúng channel, đích đầy và restart giữa job. Chỉ đánh dấu đã nghiệm thu sau khi thực sự thực hiện trên Discord.
 
-Chưa bao gồm dashboard, nhiều server, ghi âm, tự chia team hoặc điều phối nhiều service. Không có Discord token production được cấu hình sẵn trong repository; chỉ xác nhận nghiệm thu voice/Railway sau khi thực sự chạy các bước này.
+Chưa bao gồm nhiều server, ghi âm, tự chia team hoặc điều phối nhiều service. Không có Discord token production được cấu hình sẵn trong repository; chỉ xác nhận nghiệm thu voice/Railway sau khi thực sự chạy các bước này.
+
+## Web Admin Dashboard
+
+Next.js dashboard/API chạy ở service Railway riêng, điều khiển worker qua private Control API. Hỗ trợ guild hiện tại, Leaders chỉ xem theo role, quản trị groups/teams, Mass Move preview/job và phân quyền. Xem [hướng dẫn phát triển và deploy](docs/DASHBOARD.md).

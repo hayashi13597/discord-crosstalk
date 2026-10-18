@@ -34,8 +34,8 @@ export class PostgresRelays implements RelayRepository {
   private async load(client: pg.PoolClient): Promise<RelaySnapshot> {
     const groups = await client.query('SELECT id, name, state, legacy FROM relay_groups WHERE guild_id = $1 ORDER BY legacy DESC, id', [this.config.guildId]);
     const teams = await client.query(`SELECT id, group_id AS "groupId", channel_id AS "channelId", leader_id AS "leaderId",
-      worker_id AS "workerId", legacy_slot AS "legacySlot" FROM relay_teams WHERE guild_id = $1 ORDER BY worker_id`, [this.config.guildId]);
-    return { groups: groups.rows, teams: teams.rows };
+      worker_id AS "workerId", legacy_slot AS "legacySlot", display_name AS name FROM relay_teams WHERE guild_id = $1 ORDER BY worker_id`, [this.config.guildId]);
+    return { groups: groups.rows, teams: teams.rows.map(({ name, ...team }) => name ? { ...team, name } : team) };
   }
 
   initialize(): Promise<RelaySnapshot> {
@@ -86,10 +86,15 @@ export class PostgresRelays implements RelayRepository {
         throw new UserError('Cấu hình đã thay đổi. Hãy chạy lại lệnh để xác nhận cấu hình mới.');
       }
       switch (action.kind) {
-        case 'group.create': {
+        case 'group.create':
+        case 'group.rename': {
           const name = action.name.trim();
           if (!name || name.length > 80 || /[\r\n\x00-\x1f]/.test(name)) throw new UserError('Tên group phải có 1–80 ký tự và không chứa ký tự điều khiển.');
-          if (snapshot.groups.some(group => group.name.toLowerCase() === name.toLowerCase())) throw new UserError('Tên group đã được sử dụng.');
+          if (snapshot.groups.some(other => other.id !== (action.kind === 'group.rename' ? action.groupId : '') && other.name.toLowerCase() === name.toLowerCase())) throw new UserError('Tên group đã được sử dụng.');
+          if (action.kind === 'group.rename') {
+            await client.query('UPDATE relay_groups SET name=$3 WHERE guild_id=$1 AND id=$2', [guild, action.groupId, name]);
+            break;
+          }
           await client.query("INSERT INTO relay_groups(id,guild_id,name,state) VALUES ($1,$2,$3,'paused')", [randomUUID(), guild, name]);
           break;
         }
@@ -107,9 +112,24 @@ export class PostgresRelays implements RelayRepository {
           break;
         case 'team.add': {
           if (snapshot.teams.some(team => team.channelId === action.channelId)) throw new UserError('Voice channel đã được gán cho một team/group khác.');
-          const worker = this.config.workers.find(worker => worker.id > 3 && !snapshot.teams.some(team => team.workerId === worker.id));
+          const worker = this.config.workers.find(worker => worker.id > 3 && (!action.workerId || worker.id === action.workerId) && !snapshot.teams.some(team => team.workerId === worker.id));
           if (!worker) throw new UserError('Không còn bot account trống. Hãy bổ sung BOT_TOKEN_n trên Railway; bot 1–3 được giữ cho các team cũ.');
           await client.query('INSERT INTO relay_teams(id,guild_id,group_id,channel_id,worker_id) VALUES ($1,$2,$3,$4,$5)', [randomUUID(), guild, group!.id, action.channelId, worker.id]);
+          break;
+        }
+        case 'team.update': {
+          const name = action.name?.trim() || null;
+          if (name && (name.length > 80 || /[\r\n\x00-\x1f]/.test(name))) throw new UserError('Tên team không hợp lệ.');
+          const structural = action.groupId !== team!.groupId || action.channelId !== team!.channelId || action.workerId !== team!.workerId;
+          if (structural) {
+            if (team!.legacySlot) throw new UserError('Không thay đổi mapping của team gốc.');
+            const previous = snapshot.groups.find(g => g.id === team!.groupId)!;
+            if (previous.state !== 'paused' || group!.state !== 'paused') throw new UserError('Pause cả hai group trước khi thay đổi mapping.');
+            if (snapshot.teams.some(t => t.id !== team!.id && (t.channelId === action.channelId || t.workerId === action.workerId))) throw new UserError('Channel hoặc worker đã được sử dụng.');
+            if (action.workerId <= 3 || !this.config.workers.some(w => w.id === action.workerId)) throw new UserError('Worker không khả dụng.');
+          }
+          await client.query('UPDATE relay_teams SET display_name=$3,group_id=$4,channel_id=$5,worker_id=$6 WHERE guild_id=$1 AND id=$2',
+            [guild, team!.id, name, action.groupId, action.channelId, action.workerId]);
           break;
         }
         case 'team.remove':
@@ -122,7 +142,7 @@ export class PostgresRelays implements RelayRepository {
           await client.query('UPDATE relay_teams SET leader_id=$3 WHERE guild_id=$1 AND id=$2', [guild, team!.id, action.userId]);
           break;
       }
-      await client.query('INSERT INTO relay_audit(guild_id,actor_id,action,details) VALUES ($1,$2,$3,$4)', [guild, actorId, action.kind, JSON.stringify(action)]);
+      await client.query('INSERT INTO relay_audit(guild_id,actor_id,action,details) VALUES ($1,$2,$3,$4)', [guild, actorId, action.kind, JSON.stringify({ ...action, groupId: group?.id ?? team?.groupId, before: snapshot, after: await this.load(client) })]);
       return this.load(client);
     });
   }

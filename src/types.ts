@@ -13,15 +13,17 @@ export interface LeaderPresence { leaderIds: string[]; leadersKnown: boolean }
 
 export interface RelayGroup { id: string; name: string; state: 'active' | 'paused'; legacy: boolean }
 export interface RelayTeam {
-  id: string; groupId: string; channelId: string; leaderId: string | null;
+  name?: string; id: string; groupId: string; channelId: string; leaderId: string | null;
   workerId: number; legacySlot: Team | null;
 }
 export interface RelaySnapshot { groups: RelayGroup[]; teams: RelayTeam[] }
 export type RelayMutation =
   | { kind: 'group.create'; name: string }
-  | { kind: 'group.state'; groupId: string; state: 'active' | 'paused' }
+  | { kind: 'group.state'; groupId: string; state: 'active' | 'paused'; expected?: string }
+  | { kind: 'group.rename'; groupId: string; name: string; expected: string }
+  | { kind: 'team.update'; teamId: string; name: string | null; groupId: string; channelId: string; workerId: number; expected: string }
   | { kind: 'group.delete'; groupId: string; expected: string }
-  | { kind: 'team.add'; groupId: string; channelId: string }
+  | { kind: 'team.add'; groupId: string; channelId: string; workerId?: number }
   | { kind: 'team.remove'; teamId: string; expected: string }
   | { kind: 'leader.change'; teamId: string; userId: string | null; expected?: string };
 

@@ -18,7 +18,7 @@ export async function migrate(pool: pg.Pool): Promise<void> {
     await client.query('BEGIN');
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended('crosstalk:migrations', 0))");
     await client.query('CREATE TABLE IF NOT EXISTS schema_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
-    for (const [version, filename] of [[1, '001_initial.sql'], [2, '002_relay_groups.sql'], [3, '003_voice_moves.sql']] as const) {
+    for (const [version, filename] of [[1, '001_initial.sql'], [2, '002_relay_groups.sql'], [3, '003_voice_moves.sql'], [4, '004_dashboard.sql']] as const) {
       const existing = await client.query('SELECT version FROM schema_migrations WHERE version = $1', [version]);
       if (!existing.rowCount) {
         const sql = await readFile(new URL(`../migrations/${filename}`, import.meta.url), 'utf8');

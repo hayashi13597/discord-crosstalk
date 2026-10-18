@@ -66,13 +66,14 @@ export function formatLeaders(state: LeaderPresence | undefined): string {
 }
 
 interface Dependencies {
+  authorize?: (guild: import('discord.js').Guild, actorId: string, kind: 'group' | 'team') => Promise<boolean>;
   config: Config;
   relays: RelayService;
   status: (groupId?: string) => Promise<string>;
   leaders: (team: RelayTeam) => LeaderPresence | undefined;
   onError: (error: unknown) => void;
 }
-export function createCommandHandler({ config, relays, status, leaders, onError }: Dependencies) {
+export function createCommandHandler({ config, relays, status, leaders, onError, authorize }: Dependencies) {
   let accepting = true;
   const pending = new Map<string, Pending>();
   const cleanup = () => {
@@ -81,6 +82,13 @@ export function createCommandHandler({ config, relays, status, leaders, onError 
     while (pending.size >= 1000) pending.delete(pending.keys().next().value!);
   };
   const admin = async (interaction: ChatInputCommandInteraction | Extract<Interaction, { customId: string }>) => {
+    if (authorize) {
+      const confirmation = interaction.isButton() ? pending.get(interaction.customId.split(':')[2]!) : undefined;
+      const kind = interaction.isChatInputCommand() ? interaction.commandName === 'group' ? 'group' : 'team'
+        : confirmation?.kind === 'confirm' && confirmation.action.kind.startsWith('group.') ? 'group' : 'team';
+      if (!await authorize(interaction.guild!, interaction.user.id, kind)) throw new UserError('Bạn không có quyền thay đổi cấu hình này.');
+      return;
+    }
     const actor = await interaction.guild!.members.fetch({ user: interaction.user.id, force: true });
     if (!actor.permissions.has(PermissionFlagsBits.ManageGuild) && !config.adminRoleIds.some(role => actor.roles.cache.has(role))) {
       throw new UserError('Bạn cần quyền Manage Server hoặc vai trò quản trị CrossTalk.');

@@ -82,6 +82,22 @@ export class PostgresVoiceMoves implements VoiceMoveRepository {
       finishedAt: row.finished_at?.toISOString() ?? null, members: row.members };
   }
 
+  async cancellationRequested(id: string): Promise<boolean> {
+    return Boolean((await this.pool.query('SELECT cancel_requested FROM voice_move_jobs WHERE id=$1', [id])).rows[0]?.cancel_requested);
+  }
+
+  async cancel(id: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT id FROM voice_move_jobs WHERE id=$1 FOR UPDATE', [id]);
+      await client.query("UPDATE voice_move_members SET status='skipped',reason='user_cancelled',updated_at=now() WHERE job_id=$1 AND status='pending'", [id]);
+      await client.query("UPDATE voice_move_jobs SET status='Cancelled',reason='user_cancelled',finished_at=now() WHERE id=$1 AND status='Running'", [id]);
+      await client.query('COMMIT');
+    } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
+    finally { client.release(); }
+  }
+
   async recover(guildId: string): Promise<void> {
     // Called only after acquiring the existing process lease for this guild.
     const jobs = await this.pool.query("SELECT id FROM voice_move_jobs WHERE guild_id=$1 AND status='Running'", [guildId]);

@@ -47,6 +47,11 @@ export class VoiceMoveService {
       if (Date.now() >= confirmBy) throw new MoveInterrupted('confirmation_expired_before_start');
       await progress(true);
       for (const member of input.members) {
+        if (await this.repository.cancellationRequested?.(input.id)) {
+          await this.repository.cancel!(input.id);
+          await progress(true);
+          return;
+        }
         if (this.stopping || !gateway.ready()) throw new MoveInterrupted('gateway_or_shutdown');
         await this.repository.processing(input.id, member.userId);
         if (this.stopping || !gateway.ready()) throw new MoveInterrupted('gateway_or_shutdown');

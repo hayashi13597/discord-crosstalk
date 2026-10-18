@@ -50,7 +50,7 @@ describe.skipIf(!process.env.TEST_DATABASE_URL)('relay groups on real PostgreSQL
     ]);
     expect(await new PostgresLeaders(pool, config.guildId).load()).toEqual({ 1: 'alice', 2: 'bob', 3: null });
     expect((await pool.query('SELECT count(*)::int AS count FROM leader_audit')).rows[0].count).toBe(0);
-    expect((await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect((await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
   });
   it('rolls back a failed first import without modifying legacy data or leaving a bootstrap marker', async () => {
     await pool.query('TRUNCATE relay_audit, relay_teams, relay_workers, relay_groups, relay_guilds');

@@ -1,3 +1,5 @@
+import { startControl } from './control.js';
+import { capabilities, permissionRules } from './dashboard-access.js';
 import { generateDependencyReport } from '@discordjs/voice';
 import { escapeMarkdown } from 'discord.js';
 import { loadConfig } from './config.js';
@@ -22,6 +24,7 @@ async function main(): Promise<void> {
   let commands: ReturnType<typeof createCommandHandler> | undefined;
   let voiceCommands: ReturnType<typeof createVoiceMoveHandler> | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
+  let control: Awaited<ReturnType<typeof startControl>>;
   let stopping: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
     if (code) process.exitCode = code;
@@ -31,10 +34,12 @@ async function main(): Promise<void> {
       const forced = setTimeout(() => { log.fatal('Shutdown timed out'); process.exit(1); }, 12000);
       forced.unref();
       commands?.stop();
+      const closingControl = control?.stop();
       clearInterval(retentionTimer);
       // Stop new moves and finish/interrupt the current request before destroying
       // Bot 1's gateway or closing the audit database.
       await voiceCommands?.stop();
+      await closingControl;
       const closing = runtime.stop();
       await relays.stop();
       await closing;
@@ -63,7 +68,13 @@ async function main(): Promise<void> {
   },
     (workerId, userId) => repository.identify(workerId, userId));
   const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
-  commands = createCommandHandler({ config, relays, leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
+  commands = createCommandHandler({ config, relays,
+    authorize: async (guild, actorId, kind) => {
+      await guild.roles.fetch();
+      const member = await guild.members.fetch({ user: actorId, force: true });
+      const allowed = capabilities(member, config, await permissionRules(pool, config.guildId));
+      return kind === 'group' ? allowed.groups : allowed.teams;
+    }, leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
     status: async groupId => {
       const snapshot = relays.snapshot;
       const lines = [`PostgreSQL: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`];
@@ -103,6 +114,9 @@ async function main(): Promise<void> {
     if (stopping) { clearInterval(retentionTimer); return; }
     await relays.initialize();
     if (stopping) return;
+    await pool.query("UPDATE dashboard_operations SET status='Unknown',updated_at=now() WHERE guild_id=$1 AND status='Pending'", [config.guildId]);
+    control = await startControl({ config, pool, runtime, relays, moves, onError: commandError });
+    if (stopping) { await control?.stop(); return; }
     runtime.start();
     log.info('CrossTalk started; relay groups and bot connections are supervised independently');
   } catch (error) {

@@ -79,6 +79,15 @@ export class RelayRuntime {
     }
   }
 
+  controlWorkerIdentity(id: number) {
+    const user = this.workers.get(id)?.client.user;
+    return user ? { userId: user.id, name: user.username, avatar: user.displayAvatarURL() } : undefined;
+  }
+
+  controlWorkerGuild(id: number) { return this.workers.get(id)?.client.guilds.cache.get(this.config.guildId); }
+
+  controlGuild() { return this.workers.get(1)?.client.guilds.cache.get(this.config.guildId); }
+
   start(): void { for (const worker of this.workers.values()) worker.start(); }
   workerStatus(id: number): BotStatus<string> | undefined { return this.workers.get(id)?.status(); }
   groupError(id: string): string | null { return this.errors.get(id) ?? null; }
