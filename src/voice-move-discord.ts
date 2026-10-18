@@ -1,11 +1,11 @@
 import { ChannelType, DiscordAPIError, HTTPError, PermissionFlagsBits, RateLimitError, REST, Routes, Status,
   type Guild, type VoiceChannel } from 'discord.js';
 import { UserError } from './types.js';
-import { MoveInterrupted, RetryMove, type MemberOutcome, type MoveGateway } from './voice-moves.js';
+import { MoveInterrupted, type MemberOutcome, type MoveGateway } from './voice-moves.js';
 import type { MoveInput, MoveMember, MoveSnapshot } from './voice-move-types.js';
 
 /** Separate move transport: never transparently retry a PATCH after timeout/5xx.
- * Rejected rate limits are returned to the worker for a fresh eligibility check. */
+ * Rate limits stop the job without resending the request. */
 export function createMoveRest(token: string): REST {
   return new REST({ version: '10', timeout: 5000, retries: 0, rejectOnRateLimit: () => true }).setToken(token);
 }
@@ -21,7 +21,7 @@ export async function requireMoveAdmin(guild: Guild, actorId: string): Promise<v
 class ChannelCheckError extends UserError {
   constructor(message: string, readonly reason: string) { super(message); }
 }
-// Share conservative reservations across previews/jobs on the same gateway, including
+// Share conservative reservations across snapshots/jobs on the same gateway, including
 // PATCHes with unknown outcomes. Never alter the cache used by relay listeners.
 const arrivalReservations = new WeakMap<Guild, Map<string, string>>();
 export class DiscordMoveGateway implements MoveGateway {
@@ -37,7 +37,7 @@ export class DiscordMoveGateway implements MoveGateway {
   private async voiceChannel(id: string): Promise<VoiceChannel> {
     const channel = await this.guild.channels.fetch(id, { force: true });
     if (channel?.type !== ChannelType.GuildVoice || channel.guildId !== this.guild.id) {
-      throw new ChannelCheckError(`Channel ${id} không tồn tại hoặc không phải voice channel thường trong server này. Hãy sửa lựa chọn.`, 'channel_unavailable');
+      throw new ChannelCheckError(`Channel ${id} không tồn tại hoặc không phải voice channel thường trong server này. Hãy mở phiên mới.`, 'channel_unavailable');
     }
     return channel;
   }
@@ -71,7 +71,7 @@ export class DiscordMoveGateway implements MoveGateway {
     await requireMoveAdmin(this.guild, input.actorId);
     const destination = await this.permissions(input.sources.map(source => source.id), input.destinationId);
     if (destination.userLimit && this.occupancy(destination.id) + input.members.length > destination.userLimit) {
-      throw new UserError('Channel đích không đủ chỗ cho toàn bộ snapshot. Hãy chọn đích khác hoặc sửa nguồn rồi xem trước lại.');
+      throw new UserError('Channel đích không đủ chỗ cho toàn bộ snapshot. Hãy mở phiên mới và chọn lại nguồn/đích.');
     }
     this.ensureReady();
   }
@@ -99,7 +99,7 @@ export class DiscordMoveGateway implements MoveGateway {
     await this.validate(input);
     if (!input.members.length) throw new UserError('Không có người dùng thực đủ điều kiện trong các nguồn.');
     const destination = await this.voiceChannel(destinationId);
-    if (Date.now() - takenAt >= 60000) throw new UserError('Quá trình xác minh kéo dài; snapshot đã cũ. Hãy xem trước lại.');
+    if (Date.now() - takenAt >= 60000) throw new UserError('Quá trình xác minh kéo dài; snapshot đã cũ. Hãy mở phiên mới.');
     return { sources, destinationId, destinationLimit: destination.userLimit, destinationOccupancy: this.occupancy(destinationId),
       members: input.members, botsSkipped: input.botsSkipped, takenAt };
   }
@@ -137,7 +137,7 @@ export class DiscordMoveGateway implements MoveGateway {
       return { status: 'moved', reason: null };
     } catch (error) {
       if (error instanceof MoveInterrupted || (signal.aborted && !submitted)) throw new MoveInterrupted('gateway_or_shutdown');
-      if (error instanceof RateLimitError) throw new RetryMove(Math.max(error.retryAfter, error.timeToReset, error.sublimitTimeout, 1));
+      if (error instanceof RateLimitError) return { status: 'failed', reason: 'rate_limited' };
       if (error instanceof ChannelCheckError) return { status: 'failed', reason: error.reason };
       if (error instanceof DiscordAPIError) {
         if ([10007, 10065, 40032].includes(Number(error.code))) return { status: 'skipped', reason: 'left_sources' };

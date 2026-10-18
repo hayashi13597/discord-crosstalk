@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { VoiceMoveService, RetryMove, type MoveGateway } from '../src/voice-moves.js';
+import { VoiceMoveService, type MoveGateway } from '../src/voice-moves.js';
 import { moveCounts } from '../src/voice-move-types.js';
 import { MemoryMoves, moveInput } from './voice-move-helpers.js';
 
@@ -18,7 +18,7 @@ function setup(count = 3) {
   return { repository, errors, service, input, gateway, notify, run: () => service.run(input, gateway, notify) };
 }
 describe('durable mass voice move worker', () => {
-  it('writes before every move, runs sequentially and reports exact partial counts', async () => {
+  it('writes before every move, skips ineligible users and reports exact interrupted counts', async () => {
     const state = setup();
     vi.mocked(state.gateway.move)
       .mockResolvedValueOnce({ status: 'moved', reason: null })
@@ -26,7 +26,7 @@ describe('durable mass voice move worker', () => {
       .mockResolvedValueOnce({ status: 'failed', reason: 'discord_50013' });
     await state.run();
     const job = (await state.repository.get(state.input.id, 'guild'))!;
-    expect(job.status).toBe('Partially Completed');
+    expect(job.status).toBe('Interrupted');
     expect(moveCounts(job)).toEqual({ total: 3, moved: 1, skipped: 1, failed: 1, pending: 0 });
     expect(state.gateway.move).toHaveBeenCalledTimes(3);
     expect(state.notify.mock.calls.length).toBe(2);
@@ -82,17 +82,28 @@ describe('durable mass voice move worker', () => {
     expect(state.gateway.move).not.toHaveBeenCalled();
     expect(state.repository.jobs.get(state.input.id)!.status).toBe('Interrupted');
   });
-  it('waits on a refused rate limit and re-enters eligibility checks', async () => {
-    vi.useFakeTimers();
-    const state = setup(1);
-    vi.mocked(state.gateway.move).mockRejectedValueOnce(new RetryMove(2000));
-    const task = state.run();
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(state.gateway.move).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1000);
-    await task;
+  it.each(['failed', 'unknown'] as const)('stops on the first %s outcome and preserves earlier successes', async status => {
+    const state = setup(4);
+    vi.mocked(state.gateway.move)
+      .mockResolvedValueOnce({ status: 'moved', reason: null })
+      .mockResolvedValueOnce({ status, reason: status === 'unknown' ? 'outcome_unknown' : 'destination_full' });
+    await state.run();
     expect(state.gateway.move).toHaveBeenCalledTimes(2);
-    expect(state.repository.jobs.get(state.input.id)!.status).toBe('Completed');
+    const job = state.repository.jobs.get(state.input.id)!;
+    expect(job.status).toBe('Interrupted');
+    expect(job.members.map(member => member.status)).toEqual(['moved', status, 'failed', 'failed']);
+    expect(job.reason).toBe(status === 'unknown' ? 'outcome_unknown' : 'destination_full');
+    expect(state.notify).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'Interrupted' }));
+  });
+  it('stops on a refused rate limit without waiting or retrying', async () => {
+    const state = setup();
+    vi.mocked(state.gateway.move).mockResolvedValueOnce({ status: 'failed', reason: 'rate_limited' });
+    await state.run();
+    expect(state.gateway.move).toHaveBeenCalledOnce();
+    const job = state.repository.jobs.get(state.input.id)!;
+    expect(job.status).toBe('Interrupted');
+    expect(job.reason).toBe('rate_limited');
+    expect(job.members[0]).toEqual(expect.objectContaining({ status: 'failed', reason: 'rate_limited' }));
   });
   it('interrupts after gateway loss without rolling back earlier successes', async () => {
     const state = setup();
@@ -105,17 +116,11 @@ describe('durable mass voice move worker', () => {
     expect(job.status).toBe('Interrupted');
     expect(job.members.map(member => member.status)).toEqual(['moved', 'failed', 'failed']);
   });
-  it('aborts a rate-limit wait on shutdown and refuses new work', async () => {
-    vi.useFakeTimers();
+  it('refuses new work after shutdown', async () => {
     const state = setup();
-    vi.mocked(state.gateway.move).mockRejectedValueOnce(new RetryMove(60000));
-    const task = state.run();
-    await vi.advanceTimersByTimeAsync(1);
     await state.service.stop();
-    await task;
-    expect(state.gateway.move).toHaveBeenCalledTimes(1);
-    expect(state.repository.jobs.get(state.input.id)!.status).toBe('Interrupted');
     await expect(state.run()).rejects.toThrow('đang dừng');
+    expect(state.gateway.move).not.toHaveBeenCalled();
   });
   it('waits for an in-flight move to settle on shutdown and starts no further members', async () => {
     const state = setup();
@@ -129,11 +134,35 @@ describe('durable mass voice move worker', () => {
     expect(state.gateway.move).toHaveBeenCalledOnce();
     expect(state.repository.jobs.get(state.input.id)!.members.map(member => member.status)).toEqual(['moved', 'failed', 'failed']);
   });
-  it('continues when ephemeral progress delivery fails', async () => {
+  it('stops before any move when the initial progress delivery fails', async () => {
     const state = setup();
-    state.notify.mockRejectedValue(new Error('expired webhook'));
+    state.notify.mockRejectedValueOnce(new Error('expired webhook'));
     await state.run();
-    expect(state.repository.jobs.get(state.input.id)!.status).toBe('Completed');
-    expect(state.gateway.move).toHaveBeenCalledTimes(3);
+    expect(state.repository.jobs.get(state.input.id)!.status).toBe('Interrupted');
+    expect(state.repository.jobs.get(state.input.id)!.reason).toBe('progress_delivery_failed');
+    expect(state.gateway.move).not.toHaveBeenCalled();
+    expect(state.notify).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'Interrupted' }));
+  });
+  it('stops remaining members when an intermediate progress delivery fails', async () => {
+    vi.useFakeTimers();
+    const state = setup();
+    vi.mocked(state.gateway.move).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 5001);
+      return { status: 'moved', reason: null };
+    });
+    state.notify.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('webhook unavailable'));
+    await state.run();
+    expect(state.gateway.move).toHaveBeenCalledOnce();
+    const job = state.repository.jobs.get(state.input.id)!;
+    expect(job.status).toBe('Interrupted');
+    expect(job.members.map(member => member.status)).toEqual(['moved', 'failed', 'failed']);
+  });
+  it('stops if reading progress fails and propagates a failure to persist the interruption', async () => {
+    const state = setup();
+    state.repository.get.mockRejectedValueOnce(new Error('read failed'));
+    state.repository.finish.mockRejectedValueOnce(new Error('write failed'));
+    await expect(state.run()).rejects.toThrow('write failed');
+    expect(state.gateway.move).not.toHaveBeenCalled();
+    expect(state.repository.jobs.get(state.input.id)!.status).toBe('Running');
   });
 });

@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ChannelType, DiscordAPIError, PermissionFlagsBits, RateLimitError } from 'discord.js';
 import { createMoveRest, DiscordMoveGateway, requireMoveAdmin } from '../src/voice-move-discord.js';
-import { RetryMove } from '../src/voice-moves.js';
 import { discordHarness, moveInput } from './voice-move-helpers.js';
 
 describe('Discord mass move eligibility', () => {
@@ -125,11 +124,11 @@ describe('Discord mass move eligibility', () => {
     expect(typeof rest.options.rejectOnRateLimit).toBe('function');
     rest.clearHashSweeper(); rest.clearHandlerSweeper();
   });
-  it('returns rate-limit timing to the worker instead of transparently resending', async () => {
+  it('classifies rate limits as a failure without resending', async () => {
     const state = discordHarness();
     state.patch.mockRejectedValue(new RateLimitError({ timeToReset: 1500, retryAfter: 1500, sublimitTimeout: 0,
       limit: 1, method: 'PATCH', hash: 'hash', url: '/route', route: '/route', majorParameter: 'guild', global: false, scope: 'user' }));
-    await expect(new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal)).rejects.toBeInstanceOf(RetryMove);
+    await expect(new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal)).resolves.toEqual({ status: 'failed', reason: 'rate_limited' });
     expect(state.patch).toHaveBeenCalledOnce();
   });
   it('classifies Discord rejections without disclosing raw responses', async () => {

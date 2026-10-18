@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelSelectMenuBuilder, ChannelType, MessageFlags,
-  StringSelectMenuBuilder, type ChatInputCommandInteraction, type Interaction, type InteractionEditReplyOptions, type REST } from 'discord.js';
+  type ChatInputCommandInteraction, type Interaction, type InteractionEditReplyOptions, type REST } from 'discord.js';
 import { UserError } from './types.js';
 import { DiscordMoveGateway, requireMoveAdmin } from './voice-move-discord.js';
 import { formatMoveJob, VoiceMoveService } from './voice-moves.js';
-import type { MoveInput, MoveJob, MoveSnapshot } from './voice-move-types.js';
+import { moveCounts, type MoveInput, type MoveJob, type MoveSnapshot } from './voice-move-types.js';
 
 type ComponentInteraction = Extract<Interaction, { customId: string }>;
 type PanelInteraction = ChatInputCommandInteraction | ComponentInteraction;
@@ -15,19 +15,15 @@ interface Session {
   revision: number;
   expires: number;
   busy: boolean;
-  mode: 'select' | 'list' | 'preview';
   sources: Set<string>;
-  staged: string[];
   destinationId: string | null;
   snapshot?: MoveSnapshot;
-  page: number;
   timer?: NodeJS.Timeout;
   edit: (options: InteractionEditReplyOptions) => Promise<unknown>;
 }
 interface ResultPages { actorId: string; expires: number; pages: string[] }
 const noMentions = { parse: [] as never[] };
 const SESSION_MS = 600000;
-const PREVIEW_MS = 60000;
 
 function chunks(lines: string[], size = 20): string[] {
   const pages: string[] = [];
@@ -48,6 +44,22 @@ function inputFor(session: Session): MoveInput {
     botsSkipped: session.snapshot?.botsSkipped ?? 0, members: session.snapshot?.members ?? [] };
 }
 
+function compactResult(job: MoveJob, error?: string): string {
+  if (job.status === 'Running' && !error) return 'Đang chuyển…';
+  const counts = moveCounts(job);
+  const summary = `Đã chuyển ${counts.moved} người; bỏ qua ${counts.skipped + job.botsSkipped}.`;
+  if (job.status === 'Completed' && !error) return summary;
+  const reasons: Record<string, string> = {
+    destination_full: 'Voice đích đã đầy.', missing_permissions: 'Bot thiếu quyền di chuyển.',
+    channel_unavailable: 'Voice không còn khả dụng.', rate_limited: 'Discord giới hạn yêu cầu.',
+    outcome_unknown: 'Chưa xác định được kết quả di chuyển.', discord_unavailable: 'Discord không phản hồi.',
+    voice_state_unverified: 'Không xác minh được trạng thái voice.',
+    gateway_or_shutdown: 'Kết nối Discord hoặc dịch vụ đã dừng.',
+    progress_delivery_failed: 'Không cập nhật được tiến độ.',
+  };
+  return `Đã dừng: ${error ?? reasons[job.reason ?? ''] ?? 'Không thể hoàn tất di chuyển.'}\n${summary}\nJob: ${job.id}`;
+}
+
 export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
   guildId: string; service: VoiceMoveService; rest: REST; onError: (error: unknown) => void;
 }) {
@@ -60,12 +72,12 @@ export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
     void promise.finally(() => pending.delete(promise)).catch(() => {});
     return promise;
   };
-  const deadline = (session: Session) => Math.min(session.expires, session.snapshot ? session.snapshot.takenAt + PREVIEW_MS : Infinity);
+  const deadline = (session: Session) => Math.min(session.expires, session.snapshot ? session.snapshot.takenAt + 60000 : Infinity);
   const remove = (session: Session) => { sessions.delete(session.id); clearTimeout(session.timer); };
   const cancel = async (session: Session, reason: string) => {
     remove(session);
     await service.repository.create(inputFor(session), reason);
-    await session.edit({ content: `Cancelled — ${reason}. Không di chuyển ai.\nJob: ${session.id}`, components: [], allowedMentions: noMentions }).catch(onError);
+    await session.edit({ content: reason === 'user_cancelled' ? 'Đã hủy.' : 'Phiên đã kết thúc. Hãy mở lại /voice move-all.', components: [], allowedMentions: noMentions }).catch(onError);
   };
   const schedule = (session: Session) => {
     clearTimeout(session.timer);
@@ -82,46 +94,16 @@ export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
     new ButtonBuilder().setCustomId(`vm:${session.id}:${session.revision}:${action}`).setLabel(label).setStyle(style).setDisabled(disabled);
   const row = (...buttons: ButtonBuilder[]) => new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons);
   const render = (session: Session): InteractionEditReplyOptions => {
-    const sources = [...session.sources];
-    const sourcePages = chunks(session.snapshot
-      ? session.snapshot.sources.map(source => `<#${source.id}>: ${source.humans} người; ${source.bots} bot`)
-      : sources.map(id => `<#${id}>`));
-    session.page = Math.max(0, Math.min(session.page, sourcePages.length - 1));
-    const heading = `Mass Voice Move — đã chọn ${sources.length} nguồn\nĐích: ${session.destinationId ? `<#${session.destinationId}>` : 'chưa chọn'}\n`;
-    const navigation = row(button(session, 'prev', 'Trước', session.page === 0), button(session, 'next', 'Sau', session.page === sourcePages.length - 1),
-      button(session, 'back', 'Quay lại'), button(session, 'cancel', 'Hủy'));
-    if (session.mode === 'preview') {
-      const snapshot = session.snapshot!;
-      return { content: heading + `${sourcePages[session.page]}\nTrang ${session.page + 1}/${sourcePages.length}\n` +
-        `Tổng: ${snapshot.members.length} người; bỏ qua ${snapshot.botsSkipped} bot.\n` +
-        `Đích hiện có ${snapshot.destinationOccupancy} người/bot; ${snapshot.destinationLimit ? `giới hạn ${snapshot.destinationLimit}, còn ${Math.max(0, snapshot.destinationLimit - snapshot.destinationOccupancy)} chỗ` : 'không đặt giới hạn người'}.\n` +
-        'Leader rời channel team sẽ ngừng được relay từ team đó; cấu hình không đổi.\n' +
-        'Chỉ người trong snapshot và vẫn ở nguồn khi xử lý mới được chuyển. Xác nhận trong 60 giây.',
-      components: [navigation, row(button(session, 'confirm', 'Xác nhận', false, ButtonStyle.Danger))], allowedMentions: noMentions };
-    }
-    if (session.mode === 'list') {
-      const pageIds = sources.slice(session.page * 20, (session.page + 1) * 20);
-      const components: Array<NonNullable<InteractionEditReplyOptions['components']>[number]> = [];
-      if (pageIds.length) components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(new StringSelectMenuBuilder()
-        .setCustomId(`vm:${session.id}:${session.revision}:remove-page`).setPlaceholder('Chọn nguồn để xóa khỏi danh sách')
-        .setMinValues(1).setMaxValues(pageIds.length).addOptions(pageIds.map(id => ({ label: `Nguồn ${id}`, value: id })))));
-      components.push(navigation);
-      return { content: heading + sourcePages[session.page] + `\nTrang ${session.page + 1}/${sourcePages.length}`,
-        components, allowedMentions: noMentions };
-    }
-    return { content: heading + `Lượt đang chọn: ${session.staged.length} nguồn (chưa thêm).\n` +
-      'Chọn 1–25 nguồn/lượt rồi bấm Thêm nguồn; lặp lại để thêm trên 25 nguồn.\nPhiên hết hạn sau 10 phút kể từ khi mở.',
-    components: [
+    return { content: 'Mass Voice Move', components: [
       new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(new ChannelSelectMenuBuilder()
-        .setCustomId(`vm:${session.id}:${session.revision}:sources`).setPlaceholder('Chọn nguồn cho lượt này')
-        .setChannelTypes(ChannelType.GuildVoice).setMinValues(1).setMaxValues(25).setDefaultChannels(...session.staged)),
+        .setCustomId(`vm:${session.id}:${session.revision}:sources`).setPlaceholder('Voice nguồn')
+        .setChannelTypes(ChannelType.GuildVoice).setMinValues(1).setMaxValues(25).setDefaultChannels(...session.sources)),
       new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(new ChannelSelectMenuBuilder()
-        .setCustomId(`vm:${session.id}:${session.revision}:destination`).setPlaceholder('Chọn một channel đích')
+        .setCustomId(`vm:${session.id}:${session.revision}:destination`).setPlaceholder('Voice đích')
         .setChannelTypes(ChannelType.GuildVoice).setMinValues(1).setMaxValues(1)
         .setDefaultChannels(...(session.destinationId ? [session.destinationId] : []))),
-      row(button(session, 'add', 'Thêm nguồn', !session.staged.length), button(session, 'remove', 'Xóa nguồn', !session.staged.length),
-        button(session, 'clear', 'Xóa tất cả', !sources.length)),
-      row(button(session, 'list', 'Danh sách đã chọn'), button(session, 'preview', 'Xem trước', !sources.length || !session.destinationId), button(session, 'cancel', 'Hủy')),
+      row(button(session, 'confirm', 'Xác nhận', !session.sources.size || !session.destinationId, ButtonStyle.Danger),
+        button(session, 'cancel', 'Hủy')),
     ], allowedMentions: noMentions };
   };
   const stillValid = (session: Session) => {
@@ -151,6 +133,7 @@ export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
     if (!interaction.isRepliable()) return;
     let session: Session | undefined;
     let ownsLock = false;
+    let confirming = false;
     try {
       if (!accepting) throw new UserError('Dịch vụ đang dừng.');
       if (!interaction.inGuild() || interaction.guildId !== guildId || !interaction.guild) throw new UserError('Lệnh chỉ dùng trong server đã cấu hình.');
@@ -169,13 +152,13 @@ export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
         if (interaction.options.getSubcommand() !== 'move-all') throw new UserError('Lệnh không hợp lệ.');
         if (sessions.size >= 1000) throw new UserError('Có quá nhiều phiên đang mở. Hãy thử lại sau.');
         session = { id: randomUUID(), guildId, actorId: interaction.user.id, revision: 0, expires: Date.now() + SESSION_MS,
-          busy: false, mode: 'select', sources: new Set(), staged: [], destinationId: null, page: 0, edit: options => interaction.editReply(options) };
+          busy: false, sources: new Set(), destinationId: null, edit: options => interaction.editReply(options) };
         sessions.set(session.id, session);
         schedule(session);
         await session.edit(render(session));
         return;
       }
-      if (!interaction.isButton() && !interaction.isChannelSelectMenu() && !interaction.isStringSelectMenu()) throw new UserError('Tương tác không hợp lệ.');
+      if (!interaction.isButton() && !interaction.isChannelSelectMenu()) throw new UserError('Tương tác không hợp lệ.');
       if (interaction.customId.startsWith('vmr:')) {
         const [, id, index] = interaction.customId.split(':');
         const result = results.get(id!);
@@ -195,56 +178,50 @@ export function createVoiceMoveHandler({ guildId, service, rest, onError }: {
       if (session.busy || String(session.revision) !== revision) throw new UserError('Bảng đã thay đổi hoặc đang xử lý. Hãy dùng bảng mới nhất.');
       session.busy = true;
       ownsLock = true;
+      confirming = interaction.isButton() && action === 'confirm';
       await interaction.deferUpdate();
       stillValid(session);
       if (action === 'cancel') { await cancel(session, 'user_cancelled'); return; }
       await requireMoveAdmin(interaction.guild, interaction.user.id);
       stillValid(session);
-      if (interaction.isChannelSelectMenu() && session.mode === 'select') {
-        if (action === 'sources' && interaction.values.length >= 1 && interaction.values.length <= 25) session.staged = [...new Set(interaction.values)];
+      if (interaction.isChannelSelectMenu()) {
+        if (action === 'sources' && interaction.values.length >= 1 && interaction.values.length <= 25) session.sources = new Set(interaction.values);
         else if (action === 'destination' && interaction.values.length === 1) session.destinationId = interaction.values[0]!;
         else throw new UserError('Lựa chọn không hợp lệ.');
-      } else if (action === 'remove-page' && interaction.isStringSelectMenu() && session.mode === 'list') {
-        const visible = [...session.sources].slice(session.page * 20, (session.page + 1) * 20);
-        if (!interaction.values.length || interaction.values.some(id => !visible.includes(id))) throw new UserError('Nguồn cần xóa không hợp lệ.');
-        for (const id of interaction.values) session.sources.delete(id);
-      } else if (interaction.isButton()) {
-        if (action === 'back') { session.snapshot = undefined; session.mode = 'select'; session.page = 0; }
-        else if (action === 'prev' || action === 'next') session.page += action === 'next' ? 1 : -1;
-        else if (session.mode === 'select' && action === 'add') { for (const id of session.staged) session.sources.add(id); session.staged = []; }
-        else if (session.mode === 'select' && action === 'remove') { for (const id of session.staged) session.sources.delete(id); session.staged = []; }
-        else if (session.mode === 'select' && action === 'clear') { session.sources.clear(); session.staged = []; }
-        else if (session.mode === 'select' && action === 'list') { session.mode = 'list'; session.page = 0; }
-        else if (session.mode === 'select' && action === 'preview') {
-          if (session.staged.length) throw new UserError('Còn lượt nguồn chưa thêm. Bấm Thêm nguồn hoặc Xóa nguồn trước khi xem trước.');
-          if (!session.destinationId) throw new UserError('Hãy chọn channel đích.');
-          const snapshot = await new DiscordMoveGateway(interaction.guild, rest).snapshot(session.actorId, [...session.sources], session.destinationId);
-          stillValid(session);
-          session.snapshot = snapshot; session.mode = 'preview'; session.page = 0;
-        } else if (session.mode === 'preview' && action === 'confirm') {
-          const current = session;
-          const gateway = new DiscordMoveGateway(interaction.guild, rest);
-          stillValid(current);
-          remove(current);
-          await interaction.editReply({ content: `Đang bắt đầu Mass Voice Move.\nJob: ${current.id}`, components: [], allowedMentions: noMentions });
-          await service.run(inputFor(current), gateway, async job => {
-            if (job.status === 'Running') await interaction.editReply({ content: formatMoveJob(job), components: [], allowedMentions: noMentions });
-            else await showResult(interaction, job);
-          }, deadline(current));
-          return;
-        } else throw new UserError('Thao tác không hợp lệ cho bước hiện tại.');
+      } else if (confirming) {
+        if (!session.sources.size || !session.destinationId) throw new UserError('Hãy chọn voice nguồn và voice đích.');
+        const current = session;
+        const gateway = new DiscordMoveGateway(interaction.guild, rest);
+        await interaction.editReply({ content: 'Đang chuyển…', components: [], allowedMentions: noMentions });
+        current.snapshot = await gateway.snapshot(current.actorId, [...current.sources], current.destinationId!);
+        stillValid(current);
+        remove(current);
+        await service.run(inputFor(current), gateway, async job => {
+          await interaction.editReply({ content: compactResult(job), components: [], allowedMentions: noMentions });
+        }, deadline(current));
+        return;
       } else throw new UserError('Thao tác không hợp lệ.');
       session.revision++;
       await session.edit(render(session));
       schedule(session);
     } catch (error) {
       if (!(error instanceof UserError)) onError(error);
-      const message = error instanceof UserError ? error.message : 'Không thể thực hiện. Không tự thử lại việc di chuyển; dùng /voice move-status nếu đã có Job ID.';
-      const content = message + (session && ownsLock && sessions.get(session.id) !== session ? `\nJob: ${session.id}` : '');
+      const message = error instanceof UserError ? error.message : 'Không thể thực hiện di chuyển.';
+      let content = message;
+      if (session && interaction.isChatInputCommand()) remove(session);
+      if (session && ownsLock && confirming) {
+        remove(session);
+        // The job may not exist if confirmation failed before its audit was created.
+        try {
+          const job = await service.repository.get(session.id, guildId);
+          if (job) content = compactResult(job, message);
+        } catch (lookupError) { onError(lookupError); }
+        if (!content.includes(`Job: ${session.id}`)) content += `\nJob: ${session.id}`;
+      }
       try {
         if (session && ownsLock && sessions.get(session.id) === session) {
           if (deadline(session) <= Date.now() || !accepting) await cancel(session, 'session_expired');
-          else { session.revision++; await session.edit({ ...render(session), content: `${content}\n${render(session).content}` }); schedule(session); }
+          else { session.revision++; await session.edit({ ...render(session), content: `${content}\nMass Voice Move` }); schedule(session); }
         } else if (interaction.deferred || interaction.replied) await interaction.editReply({ content, components: [], allowedMentions: noMentions });
         else await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: noMentions });
       } catch (replyError) { onError(replyError); }
