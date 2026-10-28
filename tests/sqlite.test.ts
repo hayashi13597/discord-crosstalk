@@ -145,5 +145,79 @@ it('upgrades the previous SQLite schema without losing channel mappings or move 
   expect(await moves.get(input.id, 'guild')).toEqual(savedJob);
   expect((await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('leader_assignments','leader_audit')")).rows).toEqual([]);
   expect((await db.query('PRAGMA foreign_key_check')).rows).toEqual([]);
-  expect((await db.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }]);
+  expect((await db.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+});
+
+it('persists and replaces default move destinations per guild across database connections', async () => {
+  const { db, directory, moves } = await setup();
+  expect(await moves.getDestination('guild')).toBeNull();
+  await moves.setDestination('guild', 'first');
+  await moves.setDestination('other', 'separate');
+  await moves.setDestination('guild', 'replacement');
+  await db.migrate();
+  const reopened = new LocalDatabase(join(directory, 'bot.sqlite'));
+  try {
+    await reopened.migrate();
+    const repository = new SqliteVoiceMoves(reopened);
+    expect(await repository.getDestination('guild')).toBe('replacement');
+    expect(await repository.getDestination('other')).toBe('separate');
+    expect(await repository.getDestination('unset')).toBeNull();
+  } finally { await reopened.end(); }
+});
+
+it('saves source-first configuration and preserves each field when updating the other', async () => {
+  const { db, moves, directory } = await setup();
+  await moves.setSources('guild', ['a', 'b']);
+  expect(await moves.getSettings('guild')).toEqual({ sourceIds: ['a', 'b'], destinationId: null });
+  await moves.setDestination('guild', 'd');
+  await moves.setSources('guild', ['c']);
+  await moves.setDestination('other', 'separate');
+  await db.migrate();
+  const reopened = new LocalDatabase(join(directory, 'bot.sqlite'));
+  try {
+    const repository = new SqliteVoiceMoves(reopened);
+    expect(await repository.getSettings('guild')).toEqual({ sourceIds: ['c'], destinationId: 'd' });
+    expect(await repository.getSettings('other')).toEqual({ sourceIds: [], destinationId: 'separate' });
+  } finally { await reopened.end(); }
+});
+
+it('upgrades destination-only settings without losing the saved destination', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'crosstalk-settings-upgrade-'));
+  cleanup.push(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'bot.sqlite');
+  const previous = new DatabaseSync(path);
+  try {
+    for (const file of ['001_sqlite.sql', '002_sqlite_cleanup.sql', '003_voice_move_settings.sql']) {
+      previous.exec(await readFile(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+    }
+    previous.exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+      INSERT INTO schema_migrations VALUES(1),(2),(3);
+      INSERT INTO voice_move_settings(guild_id,destination_id) VALUES('guild','saved-destination');`);
+  } finally { previous.close(); }
+  const db = new LocalDatabase(path);
+  cleanup.push(() => db.end());
+  await db.migrate();
+  await db.migrate();
+  expect(await new SqliteVoiceMoves(db).getSettings('guild')).toEqual({ sourceIds: [], destinationId: 'saved-destination' });
+});
+
+it('audits late arrivals and retries, persists verification, and rejects writes after completion', async () => {
+  const { moves, db } = await setup();
+  await moves.create(input);
+  await moves.processing(input.id, 'user-one');
+  await moves.outcome(input.id, 'user-one', 'unknown', 'outcome_unknown');
+  await moves.enqueue(input.id, [{ userId: 'late', sourceId: 'source' }, input.members[0]!]);
+  expect((await moves.get(input.id, 'guild'))!.members.map(member => member.status)).toEqual(['pending', 'pending', 'pending']);
+  expect((await db.query('SELECT ordinal FROM voice_move_members ORDER BY ordinal')).rows).toEqual([{ ordinal: 1 }, { ordinal: 2 }, { ordinal: 3 }]);
+  for (const userId of ['user-one', 'user-two', 'late']) {
+    await moves.processing(input.id, userId);
+    await moves.outcome(input.id, userId, 'moved', null);
+  }
+  const verification = { checkedAt: Date.now(), remaining: [], unverified: [] };
+  await moves.verify(input.id, verification);
+  await moves.finish(input.id);
+  expect(await moves.get(input.id, 'guild')).toMatchObject({ status: 'Completed', verification });
+  await expect(moves.enqueue(input.id, [{ userId: 'late', sourceId: 'source' }])).rejects.toThrow('no longer running');
+  await expect(moves.verify(input.id, verification)).rejects.toThrow('no longer running');
+  await expect(moves.outcome(input.id, 'late', 'skipped', 'left_sources')).rejects.toThrow('could not be persisted');
 });

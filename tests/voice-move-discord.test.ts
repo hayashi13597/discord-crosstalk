@@ -38,11 +38,11 @@ describe('Discord mass move eligibility', () => {
     state.channels.get('d')!.userLimit = 1;
     await expect(gateway.snapshot('admin', ['a', 'b'], 'd')).rejects.toThrow('không đủ chỗ');
   });
-  it('reports zero humans in empty sources but refuses all-empty snapshots', async () => {
+  it('allows empty snapshots for final verification', async () => {
     const state = discordHarness();
     const gateway = new DiscordMoveGateway(state.guild, state.rest);
     expect((await gateway.snapshot('admin', ['a', 'c'], 'd')).sources.find(source => source.id === 'c')!.humans).toBe(0);
-    await expect(gateway.snapshot('admin', ['c'], 'd')).rejects.toThrow('Không có người');
+    expect((await gateway.snapshot('admin', ['c'], 'd')).members).toEqual([]);
   });
   it('freezes IDs before awaiting verification so late arrivals are not included', async () => {
     const state = discordHarness();
@@ -112,7 +112,7 @@ describe('Discord mass move eligibility', () => {
     expect(result).toEqual({ status: 'failed', reason: 'destination_full' });
     expect(state.patch).toHaveBeenCalledOnce();
   });
-  it('marks an ambiguous network error unknown without retrying the PATCH', async () => {
+  it('marks an ambiguous network error unknown for the worker to reconcile', async () => {
     const state = discordHarness();
     state.patch.mockRejectedValue(new Error('socket reset with secrets'));
     const outcome = await new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal);
@@ -124,11 +124,11 @@ describe('Discord mass move eligibility', () => {
     expect(typeof rest.options.rejectOnRateLimit).toBe('function');
     rest.clearHashSweeper(); rest.clearHandlerSweeper();
   });
-  it('classifies rate limits as a failure without resending', async () => {
+  it('returns the Discord cooldown to the worker without blindly resending', async () => {
     const state = discordHarness();
     state.patch.mockRejectedValue(new RateLimitError({ timeToReset: 1500, retryAfter: 1500, sublimitTimeout: 0,
       limit: 1, method: 'PATCH', hash: 'hash', url: '/route', route: '/route', majorParameter: 'guild', global: false, scope: 'user' }));
-    await expect(new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal)).resolves.toEqual({ status: 'failed', reason: 'rate_limited' });
+    await expect(new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal)).resolves.toEqual({ status: 'failed', reason: 'rate_limited', retryAfterMs: 1500 });
     expect(state.patch).toHaveBeenCalledOnce();
   });
   it('classifies Discord rejections without disclosing raw responses', async () => {
@@ -137,4 +137,71 @@ describe('Discord mass move eligibility', () => {
     expect(await new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal))
       .toEqual({ status: 'failed', reason: 'missing_permissions' });
   });
+  it('rechecks position after a lost PATCH response and never resends if already at destination', async () => {
+    const state = discordHarness();
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    const member = { userId: 'human', sourceId: 'a' };
+    state.patch.mockImplementationOnce(async () => {
+      state.positions.set('human', 'd');
+      throw new Error('response lost');
+    });
+    const signal = new AbortController().signal;
+    expect(await gateway.move(member, moveInput(), signal)).toMatchObject({ status: 'unknown' });
+    expect(await gateway.move(member, moveInput(), signal)).toEqual({ status: 'skipped', reason: 'already_at_destination' });
+    expect(state.patch).toHaveBeenCalledOnce();
+    expect(state.cache.get('human')!.channelId).toBe('a');
+    state.channels.get('d')!.userLimit = 1;
+    expect(await gateway.move({ userId: 'leader', sourceId: 'b' }, { ...moveInput(), sources: [{ id: 'b', humans: 1, bots: 0 }] }, signal))
+      .toMatchObject({ status: 'failed', reason: 'destination_full' });
+    expect(state.patch).toHaveBeenCalledOnce();
+  });
+  it('does not resend if fresh position cannot be read after an ambiguous outcome', async () => {
+    const state = discordHarness();
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    state.patch.mockRejectedValueOnce(new Error('response lost'));
+    const signal = new AbortController().signal;
+    await gateway.move({ userId: 'human', sourceId: 'a' }, moveInput(), signal);
+    state.get.mockRejectedValueOnce(new Error('read unavailable'));
+    expect(await gateway.move({ userId: 'human', sourceId: 'a' }, moveInput(), signal)).toMatchObject({ status: 'failed', reason: 'voice_state_unverified' });
+    expect(state.patch).toHaveBeenCalledOnce();
+  });
+  it('scans fresh positions and discovers late arrivals without mutating relay cache', async () => {
+    const state = discordHarness();
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    const snapshot = await gateway.snapshot('admin', ['a', 'b'], 'd');
+    const input = { ...moveInput(), ...snapshot };
+    state.positions.set('human', 'd');
+    state.positions.set('leader', null);
+    state.addMember('late', 'b');
+    const result = await gateway.scan(input, new AbortController().signal);
+    expect(result.remaining).toEqual([{ userId: 'late', sourceId: 'b' }]);
+    expect(result.resolved).toEqual([
+      { userId: 'human', status: 'skipped', reason: 'already_at_destination' },
+      { userId: 'leader', status: 'skipped', reason: 'left_sources' },
+    ]);
+    expect(result.unverified).toEqual([]);
+    expect(state.cache.get('human')!.channelId).toBe('a');
+    expect(state.rawGuild.voiceStates.fetch).not.toHaveBeenCalled();
+  });
+  it('records unverified people instead of treating a failed read as an empty source', async () => {
+    const state = discordHarness();
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    const input = { ...moveInput(), members: [{ userId: 'human', sourceId: 'a' }] };
+    state.get.mockRejectedValueOnce(new Error('unavailable'));
+    const result = await gateway.scan(input, new AbortController().signal);
+    expect(result.unverified).toEqual(['human']);
+    expect(result.remaining).toEqual([]);
+    expect(result.resolved).toEqual([]);
+  });
+  it('preserves destination capacity across scans when gateway events lag', async () => {
+    const state = discordHarness();
+    state.channels.get('d')!.userLimit = 1;
+    state.positions.set('human', 'd');
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    await gateway.scan({ ...moveInput(), members: [{ userId: 'human', sourceId: 'a' }] }, new AbortController().signal);
+    expect(await gateway.move({ userId: 'leader', sourceId: 'b' }, { ...moveInput(), sources: [{ id: 'b', humans: 1, bots: 0 }] }, new AbortController().signal))
+      .toMatchObject({ status: 'failed', reason: 'destination_full' });
+    expect(state.patch).not.toHaveBeenCalled();
+  });
+
 });

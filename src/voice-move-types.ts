@@ -1,3 +1,5 @@
+export const voiceSourceOptionNames = Array.from({ length: 25 }, (_, index) => index === 0 ? 'channel' : `channel-${index + 1}`);
+
 export interface MoveSource { id: string; humans: number; bots: number }
 export interface MoveMember { userId: string; sourceId: string }
 export interface MoveSnapshot {
@@ -22,15 +24,28 @@ export interface MoveInput {
 export type MoveStatus = 'Running' | 'Completed' | 'Partially Completed' | 'Cancelled' | 'Failed' | 'Interrupted';
 export type MemberStatus = 'pending' | 'processing' | 'moved' | 'skipped' | 'failed' | 'unknown';
 export interface MoveResult extends MoveMember { status: MemberStatus; reason: string | null }
+export interface MoveVerification {
+  checkedAt: number;
+  remaining: MoveMember[];
+  unverified: string[];
+}
 export interface MoveJob extends Omit<MoveInput, 'members'> {
+  verification: MoveVerification | null;
   status: MoveStatus;
   reason: string | null;
   createdAt: string;
   finishedAt: string | null;
   members: MoveResult[];
 }
+export interface VoiceMoveSettings { sourceIds: string[]; destinationId: string | null }
 export interface VoiceMoveRepository {
+  getSettings(guildId: string): Promise<VoiceMoveSettings>;
+  setSources(guildId: string, sourceIds: string[]): Promise<void>;
+  getDestination(guildId: string): Promise<string | null>;
+  setDestination(guildId: string, destinationId: string): Promise<void>;
   create(input: MoveInput, cancelledReason?: string): Promise<void>;
+  enqueue(id: string, members: MoveMember[]): Promise<void>;
+  verify(id: string, verification: MoveVerification): Promise<void>;
   processing(id: string, userId: string): Promise<void>;
   outcome(id: string, userId: string, status: 'moved' | 'skipped' | 'failed' | 'unknown', reason: string | null): Promise<void>;
   finish(id: string, interruptedReason?: string): Promise<void>;

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { ApplicationCommandOptionType, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, escapeMarkdown, MessageFlags,
   PermissionFlagsBits, REST, Routes, SlashCommandBuilder, type ChatInputCommandInteraction, type Interaction,
   type SlashCommandSubcommandBuilder } from 'discord.js';
+import { voiceSourceOptionNames } from './voice-move-types.js';
 import type { Config } from './config.js';
 import type { RelayService } from './relays.js';
 import { UserError, targetVersion, type LeaderPresence, type RelayMutation, type RelaySnapshot, type RelayTeam } from './types.js';
@@ -31,7 +32,19 @@ export const commandDefinitions = [
   new SlashCommandBuilder().setName('status').setDescription('Xem trạng thái groups và bots'),
   new SlashCommandBuilder().setName('voice').setDescription('Quản trị voice channels')
     .setDefaultMemberPermissions(PermissionFlagsBits.MoveMembers | PermissionFlagsBits.ManageGuild)
-    .addSubcommand(sub => sub.setName('move-all').setDescription('Chọn nhiều nguồn và chuyển người sang một voice channel'))
+    .addSubcommand(sub => sub.setName('move-all').setDescription('Chuyển ngay từ các voice nguồn sang đích đã cài'))
+    .addSubcommand(sub => {
+      sub.setName('set-sources').setDescription('Chọn voice nguồn cho move-all (thay thế danh sách cũ)');
+      for (const [index, name] of voiceSourceOptionNames.entries()) {
+        sub.addChannelOption(option => option.setName(name).setDescription(`Voice nguồn ${index + 1}`)
+          .addChannelTypes(ChannelType.GuildVoice).setRequired(index === 0));
+      }
+      return sub;
+    })
+    .addSubcommand(sub => sub.setName('move-config').setDescription('Xem voice nguồn và đích đã cài cho move-all'))
+    .addSubcommand(sub => sub.setName('set-destination').setDescription('Cài voice đích mặc định cho move-all')
+      .addChannelOption(option => option.setName('channel').setDescription('Voice đích mặc định')
+        .addChannelTypes(ChannelType.GuildVoice).setRequired(true)))
     .addSubcommand(sub => sub.setName('move-status').setDescription('Xem tiến độ và audit của tác vụ di chuyển')
       .addStringOption(option => option.setName('job').setDescription('Job ID').setRequired(true).setMaxLength(36))),
 ].map(command => command.setDMPermission(false).toJSON());

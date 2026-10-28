@@ -2,7 +2,7 @@ import { vi } from 'vitest';
 import type { Guild, REST } from 'discord.js';
 import { ChannelType, PermissionFlagsBits, Status } from 'discord.js';
 import { randomUUID } from 'node:crypto';
-import type { MoveInput, MoveJob, VoiceMoveRepository } from '../src/voice-move-types.js';
+import type { MoveInput, MoveJob, VoiceMoveRepository, MoveMember, MoveVerification } from '../src/voice-move-types.js';
 
 export function moveInput(count = 3): MoveInput {
   return { id: randomUUID(), guildId: 'guild', actorId: 'admin', sources: [{ id: 'a', humans: count, bots: 0 }],
@@ -11,12 +11,28 @@ export function moveInput(count = 3): MoveInput {
 }
 export class MemoryMoves implements VoiceMoveRepository {
   jobs = new Map<string, MoveJob>();
+  destinations = new Map<string, string>();
+  sources = new Map<string, string[]>();
+  getSettings = vi.fn(async (guildId: string) => ({ sourceIds: [...(this.sources.get(guildId) ?? [])], destinationId: this.destinations.get(guildId) ?? null }));
+  setSources = vi.fn(async (guildId: string, sourceIds: string[]) => { this.sources.set(guildId, [...sourceIds]); });
+  getDestination = vi.fn(async (guildId: string) => this.destinations.get(guildId) ?? null);
+  setDestination = vi.fn(async (guildId: string, destinationId: string) => { this.destinations.set(guildId, destinationId); });
   create = vi.fn(async (input: MoveInput, reason?: string) => {
     if (this.jobs.has(input.id)) throw new Error('duplicate ID');
-    this.jobs.set(input.id, { ...structuredClone(input), status: reason ? 'Cancelled' : 'Running', reason: reason ?? null,
+    this.jobs.set(input.id, { ...structuredClone(input), verification: null, status: reason ? 'Cancelled' : 'Running', reason: reason ?? null,
       createdAt: new Date().toISOString(), finishedAt: reason ? new Date().toISOString() : null,
       members: input.members.map(member => ({ ...member, status: reason ? 'skipped' : 'pending', reason: reason ?? null })) });
   });
+  enqueue = vi.fn(async (id: string, members: MoveMember[]) => {
+    const job = this.jobs.get(id)!;
+    job.verification = null;
+    for (const member of members) {
+      const existing = job.members.find(value => value.userId === member.userId);
+      if (existing) Object.assign(existing, member, { status: 'pending', reason: null });
+      else job.members.push({ ...member, status: 'pending', reason: null });
+    }
+  });
+  verify = vi.fn(async (id: string, verification: MoveVerification) => { this.jobs.get(id)!.verification = structuredClone(verification); });
   processing = vi.fn(async (id: string, userId: string) => { this.member(id, userId).status = 'processing'; });
   outcome = vi.fn(async (id: string, userId: string, status: 'moved' | 'skipped' | 'failed' | 'unknown', reason: string | null) => {
     Object.assign(this.member(id, userId), { status, reason });
@@ -71,11 +87,15 @@ export function discordHarness() {
     channels: { fetch: vi.fn(async (id: string) => channels.get(id) ?? null) },
     voiceStates: { cache, fetch: vi.fn(async (id: string) => cache.get(id) ?? { id, channelId: null }) },
   };
-  const patch = vi.fn(async (_route: string, _options: unknown) => ({}));
+  const patch = vi.fn(async (route: string, options: unknown) => {
+    positions.set(route.split('/').at(-1)!, (options as { body: { channel_id: string } }).body.channel_id);
+    return {};
+  });
+  const positions = new Map<string, string | null>();
   const get = vi.fn(async (route: string, _options: unknown) => {
     const id = route.split('/').at(-1)!;
-    return { channel_id: cache.get(id)?.channelId ?? null };
+    return { channel_id: positions.has(id) ? positions.get(id) : cache.get(id)?.channelId ?? null };
   });
   const rest = { patch, get } as unknown as REST;
-  return { guild: guild as unknown as Guild, rawGuild: guild, rest, patch, get, permissions, botPermissions, cache, channels, members, addChannel, addMember };
+  return { guild: guild as unknown as Guild, rawGuild: guild, rest, patch, get, permissions, botPermissions, cache, channels, members, positions, addChannel, addMember };
 }

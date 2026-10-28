@@ -76,7 +76,7 @@ describe('multi-group slash commands', () => {
       contents.push(reply.content);
     }
     const text = contents.join('\n');
-    for (const command of ['/help', '/start', '/stop', '/status', '/group create', '/group list', '/group info', '/group pause', '/group resume', '/group delete', '/team add', '/team remove', '/team list', '/leader list', '/leader show', '/voice move-all', '/voice move-status']) {
+    for (const command of ['/help', '/start', '/stop', '/status', '/group create', '/group list', '/group info', '/group pause', '/group resume', '/group delete', '/team add', '/team remove', '/team list', '/leader list', '/leader show', '/voice move-all', '/voice set-sources', '/voice set-destination', '/voice move-config', '/voice move-status']) {
       expect(text).toContain(command);
     }
     expect(text).toContain('Move Members');

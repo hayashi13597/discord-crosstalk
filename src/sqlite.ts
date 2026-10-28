@@ -51,7 +51,7 @@ export class LocalDatabase {
     try { return await client.query(sql, params); } finally { client.release(); }
   }
   async migrate(): Promise<void> {
-    const migrations = await Promise.all(['001_sqlite.sql', '002_sqlite_cleanup.sql'].map(async (file, index) => ({
+    const migrations = await Promise.all(['001_sqlite.sql', '002_sqlite_cleanup.sql', '003_voice_move_settings.sql', '004_voice_move_sources.sql', '005_voice_move_verification.sql'].map(async (file, index) => ({
       version: index + 1, sql: await readFile(new URL(`../migrations/${file}`, import.meta.url), 'utf8'),
     })));
     const client = await this.connect();
