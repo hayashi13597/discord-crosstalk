@@ -43,9 +43,8 @@ vi.mock('discord.js', async importOriginal => {
 
 const config = loadConfig({
   GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
-  VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
-  DATABASE_URL: 'postgresql://localhost/test',
 });
+const channels = { 1: '123456789012345671', 2: '123456789012345672', 3: '123456789012345673' };
 const activeBots: TeamBot[] = [];
 afterEach(async () => {
   await Promise.all(activeBots.splice(0).map(bot => bot.stop()));
@@ -55,22 +54,22 @@ afterEach(async () => {
 
 function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options?: WorkerOptions) {
   vi.useFakeTimers();
-  const router = new AudioRouter({ 1: config.bots[1].channelId, 2: config.bots[2].channelId, 3: config.bots[3].channelId }, config);
-  const bot = new TeamBot(1, config, router, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options);
+  const router = new AudioRouter({ 1: channels[1], 2: channels[2], 3: channels[3] }, config);
+  const bot = new TeamBot(1, config, router, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options ?? { workerId: 1, token: config.workers[0]!.token, channelId: channels[1], active: true, onIdentity: vi.fn(async () => {}) });
   activeBots.push(bot);
-  const voice = { channelId: config.bots[1].channelId, serverDeaf: false, serverMute: false };
+  const voice = { channelId: channels[1], serverDeaf: false, serverMute: false };
   const members = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, {
     id, user: { bot: id === 'relay-bot' }, guild: { id: config.guildId },
-    voice: { channelId: config.bots[1].channelId },
+    voice: { channelId: channels[1] },
     roles: { cache: new Map(id === 'alice' || id === 'relay-bot' ? [[config.leaderRoleId, {}]] : []) },
   }]));
-  const state = (id: string, channelId = config.bots[1].channelId) => ({ id, channelId, member: members.get(id)! });
+  const state = (id: string, channelId = channels[1]) => ({ id, channelId, member: members.get(id)! });
   const states = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, state(id)]));
   const me = { voice };
   const guild = { id: config.guildId, members: { me, cache: members, fetchMe: vi.fn(async () => me),
       fetch: vi.fn(async ({ user }: { user: string }) => members.get(user)) },
     roles: { fetch: vi.fn(async () => ({ id: config.leaderRoleId })) },
-    channels: { fetch: vi.fn(async () => ({ id: config.bots[1].channelId, type: 2, permissionsFor: () => ({ has: () => true }) })) },
+    channels: { fetch: vi.fn(async () => ({ id: channels[1], type: 2, permissionsFor: () => ({ has: () => true }) })) },
     voiceStates: { cache: states }, voiceAdapterCreator: vi.fn(),
   };
   const configureClient = () => {
@@ -86,7 +85,7 @@ function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options
     return stream;
   });
   const connection = Object.assign(new EventEmitter(), {
-    state: { status: 'ready' }, joinConfig: { channelId: config.bots[1].channelId }, receiver: { subscriptions, subscribe },
+    state: { status: 'ready' }, joinConfig: { channelId: channels[1] }, receiver: { subscriptions, subscribe },
     subscribe: vi.fn(), destroy: vi.fn(() => { connection.state.status = 'destroyed'; }),
   });
   mocks.join.mockReturnValue(connection);
@@ -215,7 +214,7 @@ describe('Discord lifecycle', () => {
     const { bot, subscribe } = setup();
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    expect(mocks.join).toHaveBeenCalledWith(expect.objectContaining({ group: 'bot1', selfDeaf: false, selfMute: false, channelId: config.bots[1].channelId }));
+    expect(mocks.join).toHaveBeenCalledWith(expect.objectContaining({ group: 'bot1', selfDeaf: false, selfMute: false, channelId: channels[1] }));
     expect(subscribe).toHaveBeenCalledOnce();
     expect(subscribe.mock.calls[0]![0]).toBe('alice');
     expect(bot.status().receiving).toBe(true);
@@ -266,7 +265,7 @@ describe('Discord lifecycle', () => {
     setRole('bob', true);
     const alice = subscriptions.get('alice')!;
     const bob = subscriptions.get('bob')!;
-    const next = state('alice', config.bots[2].channelId);
+    const next = state('alice', channels[2]);
     states.set('alice', next);
     members.get('alice')!.voice.channelId = next.channelId;
     bot.client.emit(Events.VoiceStateUpdate, state('alice') as never, { ...next, guild: { id: config.guildId } } as never);
@@ -433,7 +432,7 @@ describe('Discord lifecycle', () => {
 
 
 describe('dynamic worker assignments', () => {
-  const options = (active = true): WorkerOptions => ({ workerId: 1, token: 'a', channelId: config.bots[1].channelId, active, onIdentity: vi.fn(async () => {}) });
+  const options = (active = true): WorkerOptions => ({ workerId: 1, token: 'a', channelId: channels[1], active, onIdentity: vi.fn(async () => {}) });
   it('serves commands while paused without joining voice', async () => {
     const interaction = vi.fn();
     const settings = options(false);
@@ -464,7 +463,7 @@ describe('dynamic worker assignments', () => {
     vi.mocked(bot.client.guilds.fetch).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    bot.configure(1, router, config.bots[1].channelId, false);
+    bot.configure(1, router, channels[1], false);
     finish(guild as never);
     await vi.advanceTimersByTimeAsync(1);
     expect(mocks.join).not.toHaveBeenCalled();
@@ -475,7 +474,7 @@ describe('dynamic worker assignments', () => {
     const { bot, connection, router } = setup(undefined, options());
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    bot.configure(1, router, config.bots[1].channelId, false);
+    bot.configure(1, router, channels[1], false);
     connection.emit('error', new Error('late error'));
     expect(bot.status().lastError).toBeNull();
     expect(bot.status().gateway).toBe(true);

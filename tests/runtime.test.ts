@@ -11,12 +11,10 @@ vi.mock('../src/bot.js', () => ({ TeamBot: class {
 } }));
 const config = loadConfig({
   GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
-  VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
-  DATABASE_URL: 'postgresql://localhost/test',
 });
 const initial: RelaySnapshot = {
   groups: [{ id: 'a', name: 'Group A', state: 'active', legacy: true }, { id: 'b', name: 'Bravo', state: 'active', legacy: false }],
-  teams: [1, 2, 3, 4, 5, 6].map(workerId => ({ id: `team-${workerId}`, groupId: workerId <= 3 ? 'a' : 'b', channelId: `channel-${workerId}`, leaderId: `leader-${workerId}`, workerId, legacySlot: null })),
+  teams: [1, 2, 3, 4, 5, 6].map(workerId => ({ id: `team-${workerId}`, groupId: workerId <= 3 ? 'a' : 'b', channelId: `channel-${workerId}`, workerId })),
 };
 const active: RelayRuntime[] = [];
 function setup() {
@@ -25,6 +23,7 @@ function setup() {
   active.push(runtime);
   const snapshot = structuredClone(initial);
   runtime.apply(snapshot);
+  runtime.setSession(true);
   vi.clearAllMocks();
   return { runtime, snapshot };
 }
@@ -39,9 +38,9 @@ describe('group runtime reconciliation', () => {
     for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure).not.toHaveBeenCalled();
     for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure).toHaveBeenLastCalledWith(`team-${id}`, expect.anything(), `channel-${id}`, false);
   });
-  it('ignores legacy leader assignments without rebuilding any worker connections', () => {
+  it('applies group metadata without rebuilding worker connections', () => {
     const { runtime, snapshot } = setup();
-    snapshot.teams[3]!.leaderId = 'new-leader';
+    snapshot.groups[1]!.name = 'Renamed';
     runtime.apply(snapshot);
     for (const worker of mocks.workers.values()) expect(worker.configure).not.toHaveBeenCalled();
     expect(mocks.workers.get(4)!.refresh).toHaveBeenCalledOnce();
@@ -74,7 +73,7 @@ describe('group runtime reconciliation', () => {
     runtime.apply(snapshot);
     const routerB = mocks.workers.get(5)!.configure.mock.calls.at(-1)![1];
     snapshot.groups.push({ id: 'c', name: 'Charlie', state: 'active', legacy: false });
-    snapshot.teams.push({ id: 'team-c1', groupId: 'c', channelId: 'channel-c1', leaderId: null, workerId: 4, legacySlot: null });
+    snapshot.teams.push({ id: 'team-c1', groupId: 'c', channelId: 'channel-c1', workerId: 4 });
     runtime.apply(snapshot);
     vi.clearAllMocks();
     routerB.attach('team-5', { write: () => { throw new Error('B output fault'); }, close: vi.fn(), reset: vi.fn(), setReady: vi.fn() });
@@ -84,6 +83,31 @@ describe('group runtime reconciliation', () => {
     expect(runtime.groupError('c')).toBeNull();
     expect(mocks.workers.get(4)!.configure).not.toHaveBeenCalled();
     for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure).not.toHaveBeenCalled();
+  });
+  it('waits for start, preserves paused groups and disconnects on stop', () => {
+    vi.useFakeTimers();
+    const runtime = new RelayRuntime(config, { error: vi.fn() } as unknown as Logger, vi.fn(), vi.fn());
+    active.push(runtime);
+    const snapshot = structuredClone(initial);
+    snapshot.groups[1]!.state = 'paused';
+    runtime.apply(snapshot);
+    runtime.start();
+    expect(runtime.sessionRunning).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    for (const worker of mocks.workers.values()) expect(worker.configure.mock.calls.at(-1)![3]).toBe(false);
+    runtime.setSession(true);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(mocks.workers.get(1)!.configure.mock.calls.at(-1)![3]).toBe(true);
+    expect(mocks.workers.get(4)!.configure.mock.calls.at(-1)![3]).toBe(false);
+    vi.clearAllMocks();
+    runtime.setSession(true);
+    for (const worker of mocks.workers.values()) expect(worker.configure).not.toHaveBeenCalled();
+    runtime.setSession(false);
+    expect(vi.getTimerCount()).toBe(0);
+    for (const worker of mocks.workers.values()) expect(worker.configure.mock.calls.at(-1)![3]).toBe(false);
+    snapshot.groups[1]!.state = 'active';
+    runtime.apply(snapshot);
+    expect(mocks.workers.get(4)!.configure.mock.calls.at(-1)![3]).toBe(false);
   });
   it('starts all configured gateways and drains them on shutdown', async () => {
     const { runtime } = setup();

@@ -2,7 +2,8 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import { AudioRouter, FrameQueue, FRAME_BYTES, mixFrames, type Output } from '../src/audio/router.js';
 import { createCodec } from '../src/audio/codec.js';
 import { LatestPacketStream } from '../src/audio/output.js';
-import { TEAMS, type Team } from '../src/types.js';
+const TEAMS = [1, 2, 3] as const;
+type Team = (typeof TEAMS)[number];
 
 const pcm = (value: number) => {
   const result = Buffer.alloc(FRAME_BYTES);

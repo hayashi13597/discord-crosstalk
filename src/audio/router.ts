@@ -1,5 +1,4 @@
 import { performance } from 'node:perf_hooks';
-import type { Team } from '../types.js';
 
 export const FRAME_MS = 20;
 export const FRAME_SAMPLES = 960;
@@ -60,7 +59,7 @@ export function mixFrames(frames: Buffer[], singleGain: number, mixGain: number)
 
 interface Source { userId: string; epoch: number; queue: FrameQueue; remainder: Buffer }
 
-export class AudioRouter<T extends string | number = Team> {
+export class AudioRouter<T extends string | number = number> {
   private teamIds: T[];
   private leaders = new Map<T, Set<string>>();
   private available = new Set<T>();

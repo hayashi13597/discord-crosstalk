@@ -222,9 +222,7 @@ Ví dụ thao tác: `/leader set team:1 user:@Alice` sẽ gán Alice làm Leader
 
 ## 14. Ngoài phạm vi MVP / có thể phát triển sau
 
-- Dashboard quản trị leader và lịch sử hoạt động chi tiết hơn slash command.
 - Tự động tạo team, sắp xếp người chơi hoặc di chuyển thành viên giữa các kênh.
-- Web dashboard quản lý đội, điều chỉnh âm lượng và xem trạng thái.
 - Push-to-talk / bật tắt broadcast theo yêu cầu.
 - Hỗ trợ nhiều server Discord đồng thời.
 - Thông số âm lượng riêng theo từng leader hoặc từng team.
@@ -462,9 +460,7 @@ Ví dụ thao tác: `/leader set team:1 user:@Alice` sẽ gán Alice làm Leader
 
 ## 14. Ngoài phạm vi MVP / có thể phát triển sau
 
-- Dashboard quản trị leader và lịch sử hoạt động chi tiết hơn slash command.
 - Tự động tạo team, sắp xếp người chơi hoặc di chuyển thành viên giữa các kênh.
-- Web dashboard quản lý đội, điều chỉnh âm lượng và xem trạng thái.
 - Push-to-talk / bật tắt broadcast theo yêu cầu.
 - Hỗ trợ nhiều server Discord đồng thời.
 - Thông số âm lượng riêng theo từng leader hoặc từng team.

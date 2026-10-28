@@ -3,9 +3,7 @@ import type { Config } from './config.js';
 
 // Scrub secrets even when a dependency embeds them in an exception string or URL.
 export function createLogger(config: Config, destination?: DestinationStream) {
-  const secrets = [...config.workers.map(worker => worker.token), config.databaseUrl];
-  const url = new URL(config.databaseUrl);
-  if (url.password) secrets.push(url.password, decodeURIComponent(url.password));
+  const secrets = config.workers.map(worker => worker.token);
   const options: LoggerOptions = {
     level: config.logLevel,
     serializers: {
@@ -15,7 +13,7 @@ export function createLogger(config: Config, destination?: DestinationStream) {
           : { type: 'Error', code: safeError(error) };
       },
     },
-    redact: { paths: ['token', 'password', 'databaseUrl', 'authorization'], censor: '[REDACTED]' },
+    redact: { paths: ['token', 'password', 'authorization'], censor: '[REDACTED]' },
     hooks: {
       streamWrite(text) {
         for (const secret of secrets) if (secret) text = text.split(secret).join('[REDACTED]');

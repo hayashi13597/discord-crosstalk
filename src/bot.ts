@@ -8,9 +8,9 @@ import { AudioRouter } from './audio/router.js';
 import { VoiceOutput } from './audio/output.js';
 import { registerCommands } from './commands.js';
 import { safeError } from './logger.js';
-import type { LeaderPresence, Team } from './types.js';
+import type { LeaderPresence } from './types.js';
 
-export interface BotStatus<T = Team> extends LeaderPresence {
+export interface BotStatus<T = number> extends LeaderPresence {
   team: T;
   gateway: boolean;
   voice: string;
@@ -42,7 +42,7 @@ export interface WorkerOptions {
   onIdentity: (userId: string) => Promise<void>;
 }
 
-export class TeamBot<T extends string | number = Team> {
+export class TeamBot<T extends string | number = number> {
   private currentClient: Client;
   get client(): Client { return this.currentClient; }
   readonly output: VoiceOutput;
@@ -64,21 +64,21 @@ export class TeamBot<T extends string | number = Team> {
 
   private revision = 0;
   private identified = false;
-  private get workerId(): number { return this.options?.workerId ?? Number(this.team); }
-  private get token(): string { return this.options?.token ?? this.config.bots[this.team as Team].token; }
-  private get channelId(): string | null { return this.options ? this.options.channelId : this.config.bots[this.team as Team].channelId; }
-  private get enabled(): boolean { return this.options ? this.options.active && this.channelId !== null : true; }
+  private get workerId(): number { return this.options.workerId; }
+  private get token(): string { return this.options.token; }
+  private get channelId(): string | null { return this.options.channelId; }
+  private get enabled(): boolean { return this.options.active && this.channelId !== null; }
 
   constructor(public team: T, private config: Config, private router: AudioRouter<T>,
     private log: Logger,
-    private onInteraction?: (interaction: Interaction) => void, private options?: WorkerOptions) {
+    private onInteraction: ((interaction: Interaction) => void) | undefined, private options: WorkerOptions) {
     this.currentClient = this.createClient();
     this.output = new VoiceOutput(error => this.audioFault(error));
     if (this.channelId) router.attach(team, this.output);
   }
 
   configure(team: T, router: AudioRouter<T>, channelId: string | null, active: boolean): void {
-    if (!this.options || this.stopped) return;
+    if (this.stopped) return;
     ++this.revision;
     this.disable();
     this.destroyConnection();
@@ -254,7 +254,7 @@ export class TeamBot<T extends string | number = Team> {
     if (stale()) return;
     if (!this.gatewayReady()) return;
     if (!this.identified) {
-      await this.options?.onIdentity(this.client.user!.id);
+      await this.options.onIdentity(this.client.user!.id);
       if (stale()) return;
       this.identified = true;
     }

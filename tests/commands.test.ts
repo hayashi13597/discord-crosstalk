@@ -7,18 +7,16 @@ import { type LeaderPresence, type RelaySnapshot } from '../src/types.js';
 
 const env = {
   GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
-  VOICE_CHANNEL_ID_1: '123456789012345671', VOICE_CHANNEL_ID_2: '123456789012345672', VOICE_CHANNEL_ID_3: '123456789012345673',
-  DATABASE_URL: 'postgresql://localhost/test',
 };
 const initial: RelaySnapshot = {
   groups: [{ id: 'a', name: 'Group A', state: 'active', legacy: true }, { id: 'b', name: 'Bravo', state: 'paused', legacy: false }],
   teams: [
-    { id: 'a1', groupId: 'a', channelId: env.VOICE_CHANNEL_ID_1, workerId: 1, leaderId: null, legacySlot: 1 },
-    { id: 'b1', groupId: 'b', channelId: '123456789012345674', workerId: 4, leaderId: 'bob', legacySlot: null },
+    { id: 'a1', groupId: 'a', channelId: '123456789012345671', workerId: 1 },
+    { id: 'b1', groupId: 'b', channelId: '123456789012345674', workerId: 4 },
   ],
 };
 async function setup({ allowed = true, bot = false, role = false, command = 'leader', sub = 'show',
-  channel = null as string | null, team = 1 as number | null, group = null as string | null, guildId = env.GUILD_ID } = {}) {
+  channel = initial.teams[0]!.channelId as string | null, group = null as string | null, guildId = env.GUILD_ID } = {}) {
   const config = loadConfig({ ...env, ADMIN_ROLE_IDS: role ? '123456789012345679' : '' });
   const mutate = vi.fn(async () => structuredClone(initial));
   const relays = new RelayService({ initialize: async () => structuredClone(initial), mutate, identify: async () => {}, healthy: async () => true }, () => {}, vi.fn());
@@ -30,7 +28,7 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
     commandName: command, guildId, inGuild: () => true, user: { id: 'admin' }, guild: { members: { fetch }, channels: { fetch: vi.fn(async () => ({ type: ChannelType.GuildVoice, guildId })) } },
     deferred: false, replied: false,
     isButton: () => false, isAutocomplete: () => false, isChatInputCommand: () => true, isRepliable: () => true,
-    options: { getSubcommand: () => sub, getInteger: () => team, getChannel: () => channel ? { id: channel } : null,
+    options: { getSubcommand: () => sub, getChannel: () => channel ? { id: channel } : null,
       getString: (key: string) => key === 'name' ? 'Charlie' : group, getUser: () => ({ id: 'alice' }) },
     deferReply: vi.fn(async () => { interaction.deferred = true; }), editReply: vi.fn(), reply: vi.fn(),
   };
@@ -39,7 +37,8 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
   const leaders = vi.fn<(team: RelaySnapshot['teams'][number]) => LeaderPresence | undefined>(team => ({
     leadersKnown: true, leaderIds: team.id === 'b1' ? ['carol', 'dave'] : [],
   }));
-  const handler = createCommandHandler({ config, relays, status, leaders, onError });
+  const setSession = vi.fn();
+  const handler = createCommandHandler({ config, relays, status, leaders, onError, setSession });
   const run = () => handler.handle(interaction as unknown as Interaction);
   const button = (customId: string) => {
     const value = { ...interaction, customId, deferred: false, replied: false, isButton: () => true, isChatInputCommand: () => false,
@@ -47,18 +46,57 @@ async function setup({ allowed = true, bot = false, role = false, command = 'lea
     return { value, run: () => handler.handle(value as unknown as Interaction) };
   };
   const confirmId = () => interaction.editReply.mock.calls.at(-1)![0].components[0].components[0].data.custom_id as string;
-  return { interaction, run, mutate, actor, fetch, member, onError, handler, relays, status, leaders, button, confirmId };
+  return { interaction, run, mutate, actor, fetch, member, onError, handler, relays, status, leaders, button, confirmId, setSession };
 }
 
 describe('multi-group slash commands', () => {
-  it('serializes valid command definitions with legacy selectors and group autocomplete', () => {
-    expect(commandDefinitions.map(command => command.name)).toEqual(['group', 'team', 'leader', 'status', 'voice']);
+  it('serializes valid command definitions with channel selectors and group autocomplete', () => {
+    expect(commandDefinitions.map(command => command.name)).toEqual(['help', 'start', 'stop', 'group', 'team', 'leader', 'status', 'voice']);
     const text = JSON.stringify(commandDefinitions);
     expect(text).toContain('autocomplete');
     expect(text).toContain('channel');
     expect(text).toContain('team');
     const leader = commandDefinitions.find(command => command.name === 'leader')!;
     expect(leader.options!.map(option => option.name)).toEqual(['list', 'show']);
+    const show = leader.options!.find(option => option.name === 'show')!;
+    expect('options' in show && show.options).toEqual([expect.objectContaining({ name: 'channel', required: true })]);
+  });
+  it('shows the full help to ordinary members with working pagination', async () => {
+    const state = await setup({ command: 'help', allowed: false });
+    state.interaction.options.getSubcommand = () => { throw new Error('Help has no subcommand'); };
+    await state.run();
+    let reply = state.interaction.editReply.mock.calls.at(-1)![0];
+    const contents = [reply.content];
+    for (let page = 0; page < 10; page++) {
+      const next = reply.components[0]?.components[1]?.data;
+      if (!next || next.disabled) break;
+      const click = state.button(next.custom_id);
+      await click.run();
+      reply = click.value.update.mock.calls.at(-1)![0];
+      contents.push(reply.content);
+    }
+    const text = contents.join('\n');
+    for (const command of ['/help', '/start', '/stop', '/status', '/group create', '/group list', '/group info', '/group pause', '/group resume', '/group delete', '/team add', '/team remove', '/team list', '/leader list', '/leader show', '/voice move-all', '/voice move-status']) {
+      expect(text).toContain(command);
+    }
+    expect(text).toContain('Move Members');
+    expect(text).toContain('restart luôn chờ /start');
+    expect(state.fetch).not.toHaveBeenCalled();
+    expect(state.mutate).not.toHaveBeenCalled();
+    expect(state.setSession).not.toHaveBeenCalled();
+    expect(state.onError).not.toHaveBeenCalled();
+  });
+  it.each(['start', 'stop'])('authorizes /%s without requiring a subcommand', async command => {
+    const state = await setup({ command });
+    await state.run();
+    expect(state.setSession).toHaveBeenCalledWith(command === 'start');
+    expect(state.fetch).toHaveBeenCalledWith({ user: 'admin', force: true });
+    expect(state.mutate).not.toHaveBeenCalled();
+  });
+  it.each(['start', 'stop'])('refuses /%s for ordinary members', async command => {
+    const state = await setup({ command, allowed: false });
+    await state.run();
+    expect(state.setSession).not.toHaveBeenCalled();
   });
   it('checks fresh permissions for mutations and refuses ordinary members', async () => {
     const { run, fetch, mutate, interaction, actor } = await setup({ command: 'group', sub: 'create', allowed: false });
@@ -68,21 +106,14 @@ describe('multi-group slash commands', () => {
     expect(mutate).not.toHaveBeenCalled();
     expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Manage Server') }));
   });
-  it.each([{ allowed: true }, { allowed: false, role: true }])('keeps legacy team selectors for inspection %j', async options => {
+  it.each([{ allowed: true }, { allowed: false, role: true }])('allows channel-based leader inspection %j', async options => {
     const { run, mutate, interaction } = await setup(options);
     await run();
     expect(mutate).not.toHaveBeenCalled();
     expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Chưa có leader trong voice') }));
   });
-  it.each(['set', 'remove'])('redirects stale leader %s commands to Discord roles without database writes', async sub => {
-    const { run, mutate, fetch, interaction } = await setup({ sub, team: null, allowed: false });
-    await run();
-    expect(mutate).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
-    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('LEADER_ROLE_ID') }));
-  });
   it('shows all live leaders in Group B instead of persisted assignments', async () => {
-    const { run, mutate, interaction } = await setup({ team: null, channel: initial.teams[1]!.channelId });
+    const { run, mutate, interaction } = await setup({ channel: initial.teams[1]!.channelId });
     await run();
     expect(mutate).not.toHaveBeenCalled();
     expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('<@carol>, <@dave>') }));
@@ -94,7 +125,7 @@ describe('multi-group slash commands', () => {
     await state.run();
     expect(state.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Chưa xác minh') }));
   });
-  it.each([{ team: 4 }, { team: 3 }, { channel: initial.teams[1]!.channelId }, { team: null }, { guildId: 'wrong' }])('refuses invalid target/context %j', async options => {
+  it.each([{ channel: 'unassigned' }, { channel: null }, { guildId: 'wrong' }])('refuses invalid target/context %j', async options => {
     const { run, mutate, interaction } = await setup(options);
     await run();
     expect(mutate).not.toHaveBeenCalled();
@@ -161,7 +192,7 @@ describe('multi-group slash commands', () => {
     const a = await setup({ sub: 'list', allowed: false });
     await a.run();
     expect(a.fetch).not.toHaveBeenCalled();
-    expect(a.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: 'Group A\nTeam 1: Chưa có leader trong voice' }));
+    expect(a.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: 'Group A\n<#123456789012345671>: Chưa có leader trong voice' }));
     const b = await setup({ sub: 'list', group: 'b', allowed: false });
     await b.run();
     expect(b.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('<@carol>, <@dave>') }));

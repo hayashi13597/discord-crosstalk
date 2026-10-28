@@ -2,7 +2,7 @@ import { vi } from 'vitest';
 import type { Guild, REST } from 'discord.js';
 import { ChannelType, PermissionFlagsBits, Status } from 'discord.js';
 import { randomUUID } from 'node:crypto';
-import type { MoveInput, MoveJob, MemberStatus, VoiceMoveRepository } from '../src/voice-move-types.js';
+import type { MoveInput, MoveJob, VoiceMoveRepository } from '../src/voice-move-types.js';
 
 export function moveInput(count = 3): MoveInput {
   return { id: randomUUID(), guildId: 'guild', actorId: 'admin', sources: [{ id: 'a', humans: count, bots: 0 }],

@@ -1,16 +1,14 @@
-import { startControl } from './control.js';
-import { capabilities, permissionRules } from './dashboard-access.js';
 import { generateDependencyReport } from '@discordjs/voice';
 import { escapeMarkdown } from 'discord.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
-import { createPool, InstanceLease, migrate } from './database.js';
-import { PostgresRelays } from './relay-repository.js';
+import { LocalDatabase, LocalInstanceLease } from './sqlite.js';
+import { SqliteRelays } from './sqlite-relays.js';
 import { RelayService } from './relays.js';
 import { RelayRuntime } from './runtime.js';
 import { createCodec } from './audio/codec.js';
 import { createCommandHandler, formatLeaders } from './commands.js';
-import { PostgresVoiceMoves } from './voice-move-repository.js';
+import { SqliteVoiceMoves } from './sqlite-voice-moves.js';
 import { VoiceMoveService } from './voice-moves.js';
 import { createMoveRest } from './voice-move-discord.js';
 import { createVoiceMoveHandler } from './voice-move-commands.js';
@@ -18,13 +16,11 @@ import { createVoiceMoveHandler } from './voice-move-commands.js';
 async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger(config);
-  const pool = createPool(config.databaseUrl);
-  pool.on('error', error => log.error({ err: error }, 'PostgreSQL pool error'));
-  const repository = new PostgresRelays(pool, config);
+  const pool = new LocalDatabase(config.databasePath);
+  const repository = new SqliteRelays(pool, config);
   let commands: ReturnType<typeof createCommandHandler> | undefined;
   let voiceCommands: ReturnType<typeof createVoiceMoveHandler> | undefined;
   let retentionTimer: NodeJS.Timeout | undefined;
-  let control: Awaited<ReturnType<typeof startControl>>;
   let stopping: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
     if (code) process.exitCode = code;
@@ -34,17 +30,15 @@ async function main(): Promise<void> {
       const forced = setTimeout(() => { log.fatal('Shutdown timed out'); process.exit(1); }, 12000);
       forced.unref();
       commands?.stop();
-      const closingControl = control?.stop();
       clearInterval(retentionTimer);
       // Stop new moves and finish/interrupt the current request before destroying
       // Bot 1's gateway or closing the audit database.
       await voiceCommands?.stop();
-      await closingControl;
       const closing = runtime.stop();
       await relays.stop();
       await closing;
-      await lease.release();
       await pool.end();
+      await lease.release();
       clearTimeout(forced);
       log.info('CrossTalk stopped');
     })();
@@ -56,12 +50,12 @@ async function main(): Promise<void> {
     void runtime.stop().catch(() => {});
     void shutdown(1).catch(() => process.exit(1));
   };
-  const lease = new InstanceLease(pool, config.guildId, fatal);
+  const lease = new LocalInstanceLease(pool, fatal);
   const commandError = (error: unknown) => log.error({ err: error }, 'Command failed');
-  const moveRepository = new PostgresVoiceMoves(pool);
+  const moveRepository = new SqliteVoiceMoves(pool);
   const moves = new VoiceMoveService(moveRepository, commandError);
   voiceCommands = createVoiceMoveHandler({ guildId: config.guildId, service: moves,
-    rest: createMoveRest(config.bots[1].token), onError: commandError });
+    rest: createMoveRest(config.workers.find(worker => worker.id === 1)!.token), onError: commandError });
   const runtime = new RelayRuntime(config, log, interaction => {
     void commands?.handle(interaction);
     void voiceCommands?.handle(interaction);
@@ -69,27 +63,22 @@ async function main(): Promise<void> {
     (workerId, userId) => repository.identify(workerId, userId));
   const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
   commands = createCommandHandler({ config, relays,
-    authorize: async (guild, actorId, kind) => {
-      await guild.roles.fetch();
-      const member = await guild.members.fetch({ user: actorId, force: true });
-      const allowed = capabilities(member, config, await permissionRules(pool, config.guildId));
-      return kind === 'group' ? allowed.groups : allowed.teams;
-    }, leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
+    setSession: running => runtime.setSession(running), leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
     status: async groupId => {
       const snapshot = relays.snapshot;
-      const lines = [`PostgreSQL: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`];
+      const lines = [`SQLite: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`, `Phiên: ${runtime.sessionRunning ? 'started' : 'stopped — dùng /start'}`];
       for (const group of snapshot.groups.filter(group => !groupId || group.id === groupId)) {
         const teams = snapshot.teams.filter(team => team.groupId === group.id);
         lines.push(`${escapeMarkdown(group.name)}: ${group.state}; ${teams.length} team${runtime.groupError(group.id) ? '; lỗi AUDIO_ERROR (pause/resume để thử lại)' : ''}`);
         for (const team of teams) {
           const state = runtime.workerStatus(team.workerId);
-          lines.push(`${team.legacySlot ? `Team ${team.legacySlot} ` : ''}<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${formatLeaders(state)}; relay ${group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+          lines.push(`<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${formatLeaders(state)}; relay ${!runtime.sessionRunning ? 'stopped' : group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
         }
       }
       if (!groupId) {
         for (const worker of config.workers.filter(worker => !snapshot.teams.some(team => team.workerId === worker.id))) {
           const state = runtime.workerStatus(worker.id);
-          lines.push(`Bot ${worker.id}: ${worker.id <= 3 ? 'giữ cho team cũ' : 'trống'}; gateway ${state?.gateway ? 'OK' : 'offline'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+          lines.push(`Bot ${worker.id}: trống; gateway ${state?.gateway ? 'OK' : 'offline'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
         }
       }
       return lines.join('\n');
@@ -105,7 +94,7 @@ async function main(): Promise<void> {
     codec.close();
     await lease.acquire();
     if (stopping) return;
-    await migrate(pool);
+    await pool.migrate();
     if (stopping) return;
     await moveRepository.recover(config.guildId);
     await moveRepository.prune(config.guildId);
@@ -114,9 +103,6 @@ async function main(): Promise<void> {
     if (stopping) { clearInterval(retentionTimer); return; }
     await relays.initialize();
     if (stopping) return;
-    await pool.query("UPDATE dashboard_operations SET status='Unknown',updated_at=now() WHERE guild_id=$1 AND status='Pending'", [config.guildId]);
-    control = await startControl({ config, pool, runtime, relays, moves, onError: commandError });
-    if (stopping) { await control?.stop(); return; }
     runtime.start();
     log.info('CrossTalk started; relay groups and bot connections are supervised independently');
   } catch (error) {

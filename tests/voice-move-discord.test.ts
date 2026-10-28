@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { ChannelType, DiscordAPIError, PermissionFlagsBits, RateLimitError } from 'discord.js';
 import { createMoveRest, DiscordMoveGateway, requireMoveAdmin } from '../src/voice-move-discord.js';
 import { discordHarness, moveInput } from './voice-move-helpers.js';

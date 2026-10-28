@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RelayService } from '../src/relays.js';
-import { CommitUncertainError } from '../src/database.js';
+import { CommitUncertainError } from '../src/database-errors.js';
 import type { RelaySnapshot } from '../src/types.js';
 const empty: RelaySnapshot = { groups: [], teams: [] };
 function setup() {

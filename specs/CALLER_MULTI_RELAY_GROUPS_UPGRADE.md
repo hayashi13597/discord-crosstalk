@@ -173,7 +173,6 @@ Migration phải có phương án rollback và không ghi đè bảng dữ liệ
 
 ### Có thể làm sau
 
-- Dashboard web quản trị.
 - Tự chọn cấu hình số team khác 3/team group với giao diện nâng cao.
 - Điều khiển âm lượng theo group/leader.
 - Metrics độ trễ và cảnh báo tự động.

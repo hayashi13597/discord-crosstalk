@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.12.0" },
+  "engines": {
+    "node": "^22.16.0 || >=24.0.0"
+  },
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx src/main.ts",
     "build": "tsc -p tsconfig.build.json",
@@ -12,21 +14,27 @@
     "migrate": "node --env-file-if-exists=.env dist/scripts/migrate.js",
     "commands:register": "node --env-file-if-exists=.env dist/scripts/register-commands.js",
     "test": "vitest run",
-    "test:integration": "vitest run tests/postgres.test.ts tests/relay-postgres.test.ts tests/voice-move-postgres.test.ts tests/dashboard-postgres.test.ts",
+    "test:integration": "vitest run tests/sqlite.test.ts",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@discordjs/voice": "0.19.2",
     "discord.js": "14.26.5",
     "opusscript": "0.1.1",
-    "pg": "8.16.3",
-    "pino": "10.4.0"
+    "pino": "10.4.0",
+    "proper-lockfile": "^4.1.2"
   },
-  "optionalDependencies": { "@discordjs/opus": "0.10.0" },
-  "overrides": { "prism-media": { "opusscript": "$opusscript" } },
+  "optionalDependencies": {
+    "@discordjs/opus": "0.10.0"
+  },
+  "overrides": {
+    "prism-media": {
+      "opusscript": "$opusscript"
+    }
+  },
   "devDependencies": {
     "@types/node": "24.19.2",
-    "@types/pg": "8.15.5",
+    "@types/proper-lockfile": "^4.1.4",
     "tsx": "4.20.6",
     "typescript": "5.9.3",
     "vitest": "4.1.11"

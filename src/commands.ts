@@ -1,19 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, escapeMarkdown, MessageFlags,
+import { ApplicationCommandOptionType, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, escapeMarkdown, MessageFlags,
   PermissionFlagsBits, REST, Routes, SlashCommandBuilder, type ChatInputCommandInteraction, type Interaction,
   type SlashCommandSubcommandBuilder } from 'discord.js';
 import type { Config } from './config.js';
 import type { RelayService } from './relays.js';
-import { isTeam, TEAMS, UserError, targetVersion, type LeaderPresence, type RelayMutation, type RelaySnapshot, type RelayTeam } from './types.js';
+import { UserError, targetVersion, type LeaderPresence, type RelayMutation, type RelaySnapshot, type RelayTeam } from './types.js';
 
 const groupOption = (sub: SlashCommandSubcommandBuilder, required = true) => sub.addStringOption(option => option
   .setName('group').setDescription('Relay group').setRequired(required).setAutocomplete(true));
-const channelOption = (sub: SlashCommandSubcommandBuilder, required = true) => sub.addChannelOption(option => option
-  .setName('channel').setDescription('Voice channel của team').addChannelTypes(ChannelType.GuildVoice).setRequired(required));
-const teamSelector = (sub: SlashCommandSubcommandBuilder) => channelOption(sub, false).addIntegerOption(option => option
-  .setName('team').setDescription('Số team cũ của Group A (chọn team hoặc channel)').addChoices(...TEAMS.map(value => ({ name: `Team ${value}`, value }))));
-
+const channelOption = (sub: SlashCommandSubcommandBuilder) => sub.addChannelOption(option => option
+  .setName('channel').setDescription('Voice channel của team').addChannelTypes(ChannelType.GuildVoice).setRequired(true));
 export const commandDefinitions = [
+  new SlashCommandBuilder().setName('help').setDescription('Xem tất cả lệnh và cách sử dụng'),
+  new SlashCommandBuilder().setName('start').setDescription('Kết nối voice cho tất cả group active'),
+  new SlashCommandBuilder().setName('stop').setDescription('Ngắt voice của tất cả bots'),
   new SlashCommandBuilder().setName('group').setDescription('Quản lý relay groups')
     .addSubcommand(sub => sub.setName('create').setDescription('Tạo group paused').addStringOption(option => option.setName('name').setDescription('Tên group').setRequired(true).setMaxLength(80)))
     .addSubcommand(sub => sub.setName('list').setDescription('Liệt kê groups'))
@@ -27,7 +27,7 @@ export const commandDefinitions = [
     .addSubcommand(sub => groupOption(sub.setName('list').setDescription('Liệt kê teams của group'))),
   new SlashCommandBuilder().setName('leader').setDescription('Xem leaders theo role CrossTalk')
     .addSubcommand(sub => groupOption(sub.setName('list').setDescription('Xem leaders; mặc định Group A'), false))
-    .addSubcommand(sub => teamSelector(sub.setName('show').setDescription('Xem leader của một team'))),
+    .addSubcommand(sub => channelOption(sub.setName('show').setDescription('Xem leader của một team'))),
   new SlashCommandBuilder().setName('status').setDescription('Xem trạng thái groups và bots'),
   new SlashCommandBuilder().setName('voice').setDescription('Quản trị voice channels')
     .setDefaultMemberPermissions(PermissionFlagsBits.MoveMembers | PermissionFlagsBits.ManageGuild)
@@ -35,6 +35,24 @@ export const commandDefinitions = [
     .addSubcommand(sub => sub.setName('move-status').setDescription('Xem tiến độ và audit của tác vụ di chuyển')
       .addStringOption(option => option.setName('job').setDescription('Job ID').setRequired(true).setMaxLength(36))),
 ].map(command => command.setDMPermission(false).toJSON());
+
+// Derive the command list from registration so help stays complete as commands change.
+const helpText = [
+  '**Các lệnh CrossTalk**',
+  'Tham số <...> là bắt buộc; [...] là tùy chọn. Chọn group từ danh sách gợi ý.',
+  ...commandDefinitions.flatMap(command => {
+    const subs = command.options?.filter(option => option.type === ApplicationCommandOptionType.Subcommand);
+    if (!subs?.length) return [`\`/${command.name}\` — ${command.description}`];
+    return subs.map(sub => {
+      const args = sub.options?.map(option => option.required ? `${option.name}:<giá trị>` : `[${option.name}:giá trị]`).join(' ');
+      return `\`/${command.name} ${sub.name}${args ? ` ${args}` : ''}\` — ${sub.description}`;
+    });
+  }),
+  '',
+  '**Quyền:** Các lệnh xem và /help dành cho mọi thành viên. /start, /stop và thay đổi group/team cần Manage Server hoặc role quản trị CrossTalk. /voice cần cả Manage Server và Move Members (hoặc Administrator).',
+  '**Bắt đầu:** /team add → /start → /status. Group mới tạo đang paused: dùng /group resume. /start giữ nguyên group paused; restart luôn chờ /start.',
+  'Leader được xác định theo role. Dùng /leader show channel:<voice> để xem leader trong channel.',
+].join('\n');
 
 export async function registerCommands(token: string, guildId: string, applicationId?: string): Promise<void> {
   const rest = new REST({ version: '10', timeout: 15000 }).setToken(token);
@@ -66,14 +84,14 @@ export function formatLeaders(state: LeaderPresence | undefined): string {
 }
 
 interface Dependencies {
-  authorize?: (guild: import('discord.js').Guild, actorId: string, kind: 'group' | 'team') => Promise<boolean>;
+  setSession?: (running: boolean) => void;
   config: Config;
   relays: RelayService;
   status: (groupId?: string) => Promise<string>;
   leaders: (team: RelayTeam) => LeaderPresence | undefined;
   onError: (error: unknown) => void;
 }
-export function createCommandHandler({ config, relays, status, leaders, onError, authorize }: Dependencies) {
+export function createCommandHandler({ config, relays, status, leaders, onError, setSession }: Dependencies) {
   let accepting = true;
   const pending = new Map<string, Pending>();
   const cleanup = () => {
@@ -82,13 +100,6 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
     while (pending.size >= 1000) pending.delete(pending.keys().next().value!);
   };
   const admin = async (interaction: ChatInputCommandInteraction | Extract<Interaction, { customId: string }>) => {
-    if (authorize) {
-      const confirmation = interaction.isButton() ? pending.get(interaction.customId.split(':')[2]!) : undefined;
-      const kind = interaction.isChatInputCommand() ? interaction.commandName === 'group' ? 'group' : 'team'
-        : confirmation?.kind === 'confirm' && confirmation.action.kind.startsWith('group.') ? 'group' : 'team';
-      if (!await authorize(interaction.guild!, interaction.user.id, kind)) throw new UserError('Bạn không có quyền thay đổi cấu hình này.');
-      return;
-    }
     const actor = await interaction.guild!.members.fetch({ user: interaction.user.id, force: true });
     if (!actor.permissions.has(PermissionFlagsBits.ManageGuild) && !config.adminRoleIds.some(role => actor.roles.cache.has(role))) {
       throw new UserError('Bạn cần quyền Manage Server hoặc vai trò quản trị CrossTalk.');
@@ -101,12 +112,9 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
     return group;
   };
   const teamFor = (interaction: ChatInputCommandInteraction, snapshot: RelaySnapshot): RelayTeam => {
-    const channel = interaction.options.getChannel('channel');
-    const slot = interaction.commandName === 'leader' ? interaction.options.getInteger('team') : null;
-    if ((!channel && slot === null) || (channel && slot !== null)) throw new UserError('Hãy chọn đúng một trong channel hoặc team:1/2/3.');
-    if (slot !== null && !isTeam(slot)) throw new UserError('Team cũ phải là 1, 2 hoặc 3.');
-    const team = snapshot.teams.find(team => channel ? team.channelId === channel.id : team.legacySlot === slot);
-    if (!team) throw new UserError('Team không còn tồn tại hoặc channel chưa được gán. Số team cũ không được chuyển sang team khác.');
+    const channel = interaction.options.getChannel('channel', true);
+    const team = snapshot.teams.find(team => team.channelId === channel.id);
+    if (!team) throw new UserError('Channel chưa được gán cho team nào.');
     return team;
   };
   const pageComponents = (id: string, index: number, count: number) => [new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -130,7 +138,7 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
   };
 
   const handle = async (interaction: Interaction): Promise<void> => {
-    if (interaction.isButton() ? !interaction.customId.startsWith('ct:') : !['group', 'team', 'leader', 'status'].includes('commandName' in interaction ? interaction.commandName : '')) return;
+    if (interaction.isButton() ? !interaction.customId.startsWith('ct:') : !['help', 'start', 'stop', 'group', 'team', 'leader', 'status'].includes('commandName' in interaction ? interaction.commandName : '')) return;
     cleanup();
     try {
       if (!accepting) throw new UserError('Dịch vụ đang dừng, vui lòng thử lại sau.');
@@ -164,7 +172,18 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
       }
       if (!interaction.isChatInputCommand()) return;
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (interaction.commandName === 'help') { await respond(interaction, helpText); return; }
       if (interaction.commandName === 'status') { await respond(interaction, await status()); return; }
+      if (interaction.commandName === 'start' || interaction.commandName === 'stop') {
+        await admin(interaction);
+        if (!setSession) throw new UserError('Điều khiển phiên chưa sẵn sàng.');
+        const running = interaction.commandName === 'start';
+        setSession(running);
+        await respond(interaction, running
+          ? 'Đã bật phiên. Bot đang kết nối các channel của group active; group paused được giữ nguyên. Xem /status để kiểm tra kết quả.'
+          : 'Đã dừng phiên và ngắt voice của tất cả bots. Dùng /start để kết nối lại.');
+        return;
+      }
       const sub = interaction.options.getSubcommand();
       const snapshot = relays.snapshot;
       if (interaction.commandName === 'group') {
@@ -181,11 +200,11 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
         }
         const group = groupFor(interaction, snapshot);
         if (sub === 'delete') {
-          if (group.legacy) throw new UserError('Không được xóa Group A chứa ánh xạ team cũ.');
+          if (group.legacy) throw new UserError('Không được xóa Group A mặc định.');
           await confirm(interaction, { kind: 'group.delete', groupId: group.id, expected: targetVersion(snapshot, 'group', group.id) }, `Xóa group ${escapeMarkdown(group.name)} và toàn bộ team trong group?`);
         } else if (sub === 'pause' || sub === 'resume') {
           await relays.mutate({ kind: 'group.state', groupId: group.id, state: sub === 'pause' ? 'paused' : 'active' }, interaction.user.id);
-          await respond(interaction, sub === 'pause' ? 'Đã tạm ngừng relay của group.' : 'Đã bật group; các bot sẽ kết nối lại. Xem /group info để kiểm tra.');
+          await respond(interaction, sub === 'pause' ? 'Đã tạm ngừng relay của group.' : 'Đã bật group; bot sẽ kết nối nếu phiên đã /start. Xem /group info để kiểm tra.');
         } else throw new UserError('Lệnh không hợp lệ.');
         return;
       }
@@ -201,18 +220,14 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
           const channel = await interaction.guild!.channels.fetch(channelId);
           if (channel?.type !== ChannelType.GuildVoice || channel.guildId !== config.guildId) throw new UserError('Hãy chọn voice channel thường trong server này; không dùng Stage.');
           await relays.mutate({ kind: 'team.add', groupId: group.id, channelId }, interaction.user.id);
-          await respond(interaction, `Đã thêm team <#${channelId}> vào ${escapeMarkdown(group.name)}. ${group.state === 'paused' ? 'Group đang paused.' : 'Bot sẽ kết nối; xem /group info.'}`);
+          await respond(interaction, `Đã thêm team <#${channelId}> vào ${escapeMarkdown(group.name)}. ${group.state === 'paused' ? 'Group đang paused.' : 'Bot sẽ kết nối nếu phiên đã /start; xem /group info.'}`);
         } else throw new UserError('Lệnh không hợp lệ.');
         return;
       }
       if (sub === 'list') {
         const group = groupFor(interaction, snapshot, true);
-        const lines = snapshot.teams.filter(team => team.groupId === group.id).map(team => `${team.legacySlot ? `Team ${team.legacySlot}` : `<#${team.channelId}>`}: ${formatLeaders(leaders(team))}`);
+        const lines = snapshot.teams.filter(team => team.groupId === group.id).map(team => `<#${team.channelId}>: ${formatLeaders(leaders(team))}`);
         await respond(interaction, `${escapeMarkdown(group.name)}\n${lines.join('\n') || 'Chưa có team.'}`);
-        return;
-      }
-      if (sub === 'set' || sub === 'remove') {
-        await respond(interaction, `Leader được xác định tự động theo role <@&${config.leaderRoleId}> (LEADER_ROLE_ID). Hãy thêm/gỡ role trên thành viên trong Discord.`);
         return;
       }
       const team = teamFor(interaction, snapshot);

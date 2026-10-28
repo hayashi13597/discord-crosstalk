@@ -14,6 +14,13 @@ export class RelayRuntime {
   private snapshot: RelaySnapshot = { groups: [], teams: [] };
   private idle: AudioRouter<string>;
   private stopped = false;
+  private session = false;
+  get sessionRunning(): boolean { return this.session; }
+  setSession(running: boolean): void {
+    if (this.stopped || running === this.session) return;
+    this.session = running;
+    this.apply(this.snapshot);
+  }
   constructor(private config: Config, private log: Logger, onInteraction: (interaction: Interaction) => void,
     identify: (workerId: number, userId: string) => Promise<void>) {
     this.idle = new AudioRouter<string>({}, config);
@@ -29,7 +36,7 @@ export class RelayRuntime {
     const old = this.snapshot;
     this.snapshot = structuredClone(snapshot);
     const changed = new Set<string>();
-    const signature = (group: RelayGroup) => JSON.stringify([group.state,
+    const signature = (group: RelayGroup) => JSON.stringify([this.session, group.state,
       snapshot.teams.filter(team => team.groupId === group.id).map(team => [team.id, team.channelId, team.workerId])]);
     for (const [id, group] of this.groups) {
       const next = snapshot.groups.find(group => group.id === id);
@@ -51,8 +58,8 @@ export class RelayRuntime {
         const router = new AudioRouter<string>(Object.fromEntries(teams.map(team => [team.id, team.channelId])), this.config, undefined,
           error => this.contain(id, error, old));
         this.groups.set(id, { signature: signature(group), router });
-        for (const team of teams) this.workers.get(team.workerId)?.configure(team.id, router, team.channelId, group.state === 'active');
-        if (group.state === 'active') router.start();
+        for (const team of teams) this.workers.get(team.workerId)?.configure(team.id, router, team.channelId, this.session && group.state === 'active');
+        if (this.session && group.state === 'active') router.start();
       } catch (error) { this.contain(id, error, old); }
     }
     // Metadata updates leave connections, timers and other groups intact.
@@ -78,15 +85,6 @@ export class RelayRuntime {
       catch (error) { this.log.error({ group: id, worker: workerId, err: error }, 'Worker cleanup failed'); }
     }
   }
-
-  controlWorkerIdentity(id: number) {
-    const user = this.workers.get(id)?.client.user;
-    return user ? { userId: user.id, name: user.username, avatar: user.displayAvatarURL() } : undefined;
-  }
-
-  controlWorkerGuild(id: number) { return this.workers.get(id)?.client.guilds.cache.get(this.config.guildId); }
-
-  controlGuild() { return this.workers.get(1)?.client.guilds.cache.get(this.config.guildId); }
 
   start(): void { for (const worker of this.workers.values()) worker.start(); }
   workerStatus(id: number): BotStatus<string> | undefined { return this.workers.get(id)?.status(); }

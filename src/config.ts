@@ -1,11 +1,8 @@
-import { TEAMS, type Team } from './types.js';
-
 export interface Config {
   guildId: string;
   leaderRoleId: string;
   workers: { id: number; token: string }[];
-  bots: Record<Team, { token: string; channelId: string }>;
-  databaseUrl: string;
+  databasePath: string;
   adminRoleIds: string[];
   jitterMs: number;
   maxQueueMs: number;
@@ -31,18 +28,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (!Number.isFinite(value) || value < min || value > max) throw new Error(`Invalid ${key}`);
     return value;
   };
-  const bots = Object.fromEntries(TEAMS.map(team => [team, {
-    token: required(`BOT_TOKEN_${team}`), channelId: id(`VOICE_CHANNEL_ID_${team}`),
-  }])) as Config['bots'];
-  if (new Set(TEAMS.map(t => bots[t].token)).size !== 3) throw new Error('Bot tokens must be distinct');
-  if (new Set(TEAMS.map(t => bots[t].channelId)).size !== 3) throw new Error('Voice channels must be distinct');
+  for (const workerId of [1, 2, 3]) required(`BOT_TOKEN_${workerId}`);
   const workers = Object.keys(env).filter(key => /^BOT_TOKEN_[1-9]\d*$/.test(key) && env[key]?.trim())
     .map(key => ({ id: Number(key.slice(10)), token: required(key) })).sort((a, b) => a.id - b.id);
   if (workers.some(worker => !Number.isSafeInteger(worker.id))) throw new Error('Invalid worker ID');
   if (new Set(workers.map(worker => worker.token)).size !== workers.length) throw new Error('Bot tokens must be distinct');
-  const databaseUrl = required('DATABASE_URL');
-  const url = new URL(databaseUrl);
-  if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error('DATABASE_URL must use PostgreSQL');
+  const databasePath = env.DATABASE_PATH === undefined ? './data/crosstalk.sqlite' : env.DATABASE_PATH.trim();
+  if (!databasePath || databasePath === ':memory:') throw new Error('DATABASE_PATH must be a persistent file path');
   const adminRoleIds = (env.ADMIN_ROLE_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean);
   if (adminRoleIds.some(role => !snowflake.test(role))) throw new Error('Invalid ADMIN_ROLE_IDS');
   const jitterMs = number('JITTER_BUFFER_MS', 60, 0, 500);
@@ -53,7 +45,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const logLevel = env.LOG_LEVEL ?? 'info';
   if (!['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'].includes(logLevel)) throw new Error('Invalid LOG_LEVEL');
   return {
-    guildId: id('GUILD_ID'), leaderRoleId: id('LEADER_ROLE_ID'), bots, workers, databaseUrl, adminRoleIds, jitterMs, maxQueueMs,
+    guildId: id('GUILD_ID'), leaderRoleId: id('LEADER_ROLE_ID'), workers, databasePath, adminRoleIds, jitterMs, maxQueueMs,
     singleGain: number('SINGLE_SOURCE_GAIN', 1, 0, 2),
     mixGain: number('MIX_SOURCE_GAIN', 0.5, 0, 1), logLevel,
   };

@@ -1,4 +1,4 @@
-import { CommitUncertainError } from './database.js';
+import { CommitUncertainError } from './database-errors.js';
 import type { RelayRepository } from './relay-repository.js';
 import type { RelayMutation, RelaySnapshot } from './types.js';
 

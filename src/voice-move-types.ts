@@ -37,8 +37,6 @@ export interface VoiceMoveRepository {
   get(id: string, guildId: string): Promise<MoveJob | undefined>;
   recover(guildId: string): Promise<void>;
   prune(guildId: string): Promise<void>;
-  cancellationRequested?(id: string): Promise<boolean>;
-  cancel?(id: string): Promise<void>;
 }
 export function moveCounts(job: MoveJob) {
   return {

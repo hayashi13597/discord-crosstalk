@@ -1,31 +1,19 @@
-export const TEAMS = [1, 2, 3] as const;
-export type Team = (typeof TEAMS)[number];
-export type Leaders = Record<Team, string | null>;
-export const emptyLeaders = (): Leaders => ({ 1: null, 2: null, 3: null });
-
-export function isTeam(value: number): value is Team {
-  return TEAMS.includes(value as Team);
-}
-
 export class UserError extends Error {}
 
 export interface LeaderPresence { leaderIds: string[]; leadersKnown: boolean }
 
 export interface RelayGroup { id: string; name: string; state: 'active' | 'paused'; legacy: boolean }
 export interface RelayTeam {
-  name?: string; id: string; groupId: string; channelId: string; leaderId: string | null;
-  workerId: number; legacySlot: Team | null;
+  id: string; groupId: string; channelId: string;
+  workerId: number;
 }
 export interface RelaySnapshot { groups: RelayGroup[]; teams: RelayTeam[] }
 export type RelayMutation =
   | { kind: 'group.create'; name: string }
   | { kind: 'group.state'; groupId: string; state: 'active' | 'paused'; expected?: string }
-  | { kind: 'group.rename'; groupId: string; name: string; expected: string }
-  | { kind: 'team.update'; teamId: string; name: string | null; groupId: string; channelId: string; workerId: number; expected: string }
   | { kind: 'group.delete'; groupId: string; expected: string }
-  | { kind: 'team.add'; groupId: string; channelId: string; workerId?: number }
-  | { kind: 'team.remove'; teamId: string; expected: string }
-  | { kind: 'leader.change'; teamId: string; userId: string | null; expected?: string };
+  | { kind: 'team.add'; groupId: string; channelId: string }
+  | { kind: 'team.remove'; teamId: string; expected: string };
 
 // Confirmations bind to the complete current target, including child teams.
 export function targetVersion(snapshot: RelaySnapshot, kind: 'group' | 'team', id: string): string {
