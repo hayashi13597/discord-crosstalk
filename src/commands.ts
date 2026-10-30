@@ -63,7 +63,7 @@ const helpText = [
   }),
   '',
   '**Quyền:** Các lệnh xem và /help dành cho mọi thành viên. /start, /stop và thay đổi group/team cần Manage Server hoặc role quản trị CrossTalk. /voice cần cả Manage Server và Move Members (hoặc Administrator).',
-  '**Bắt đầu:** /team add → /start → /status. Group mới tạo đang paused: dùng /group resume. /start giữ nguyên group paused; restart luôn chờ /start.',
+  '**Bắt đầu:** /team add → /start → /status. Group mới tạo đang paused: dùng /group resume. /start giữ nguyên group paused; trạng thái phiên /start được lưu và tự khôi phục sau restart.',
   'Leader được xác định theo role. Dùng /leader show channel:<voice> để xem leader trong channel.',
 ].join('\n');
 
@@ -73,10 +73,9 @@ export async function registerCommands(token: string, guildId: string, applicati
   await rest.put(Routes.applicationGuildCommands(applicationId, guildId), { body: commandDefinitions });
 }
 
-type Pending = { actorId: string; expires: number } & (
-  | { kind: 'confirm'; action: RelayMutation }
-  | { kind: 'pages'; pages: string[] }
-);
+interface PendingConfirm { actorId: string; expires: number; action: RelayMutation }
+interface PendingPages { actorId: string; expires: number; pages: string[] }
+
 export function paginate(content: string): string[] {
   const pages: string[] = [];
   let current = '';
@@ -97,7 +96,7 @@ export function formatLeaders(state: LeaderPresence | undefined): string {
 }
 
 interface Dependencies {
-  setSession?: (running: boolean) => void;
+  setSession?: (running: boolean) => Promise<void> | void;
   config: Config;
   relays: RelayService;
   status: (groupId?: string) => Promise<string>;
@@ -106,11 +105,17 @@ interface Dependencies {
 }
 export function createCommandHandler({ config, relays, status, leaders, onError, setSession }: Dependencies) {
   let accepting = true;
-  const pending = new Map<string, Pending>();
+  // Isolate admin confirmations from public pagination state so ordinary member pagination cannot evict pending confirmations.
+  const confirmations = new Map<string, PendingConfirm>();
+  const pages = new Map<string, PendingPages>();
+  const sweep = <T extends { expires: number }>(map: Map<string, T>, max: number) => {
+    const now = Date.now();
+    for (const [key, value] of map) if (value.expires <= now) map.delete(key);
+    while (map.size >= max) map.delete(map.keys().next().value!);
+  };
   const cleanup = () => {
-    for (const [key, value] of pending) if (value.expires <= Date.now()) pending.delete(key);
-    // Keep bounded state even if a large server requests many pages at once.
-    while (pending.size >= 1000) pending.delete(pending.keys().next().value!);
+    sweep(confirmations, 200);
+    sweep(pages, 1000);
   };
   const admin = async (interaction: ChatInputCommandInteraction | Extract<Interaction, { customId: string }>) => {
     const actor = await interaction.guild!.members.fetch({ user: interaction.user.id, force: true });
@@ -135,15 +140,15 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
     new ButtonBuilder().setCustomId(`ct:page:${id}:${index + 1}`).setLabel('Sau').setStyle(ButtonStyle.Secondary).setDisabled(index === count - 1),
   )];
   const respond = async (interaction: ChatInputCommandInteraction, content: string) => {
-    const pages = paginate(content);
-    if (pages.length === 1) { await interaction.editReply({ content: pages[0], components: [], allowedMentions: { parse: [] } }); return; }
+    const items = paginate(content);
+    if (items.length === 1) { await interaction.editReply({ content: items[0], components: [], allowedMentions: { parse: [] } }); return; }
     const id = randomUUID();
-    pending.set(id, { kind: 'pages', actorId: interaction.user.id, expires: Date.now() + 600000, pages });
-    await interaction.editReply({ content: `${pages[0]}\nTrang 1/${pages.length}`, components: pageComponents(id, 0, pages.length), allowedMentions: { parse: [] } });
+    pages.set(id, { actorId: interaction.user.id, expires: Date.now() + 600000, pages: items });
+    await interaction.editReply({ content: `${items[0]}\nTrang 1/${items.length}`, components: pageComponents(id, 0, items.length), allowedMentions: { parse: [] } });
   };
   const confirm = async (interaction: ChatInputCommandInteraction, action: RelayMutation, description: string) => {
     const id = randomUUID();
-    pending.set(id, { kind: 'confirm', actorId: interaction.user.id, expires: Date.now() + 60000, action });
+    confirmations.set(id, { actorId: interaction.user.id, expires: Date.now() + 60000, action });
     await interaction.editReply({ content: `${description}\nXác nhận trong 60 giây.`, allowedMentions: { parse: [] }, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`ct:confirm:${id}`).setLabel('Xác nhận xóa').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId(`ct:cancel:${id}`).setLabel('Hủy').setStyle(ButtonStyle.Secondary),
@@ -164,20 +169,23 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
       }
       if (interaction.isButton()) {
         const [, kind, id, page] = interaction.customId.split(':');
-        const value = pending.get(id!);
-        if (!value) throw new UserError('Yêu cầu đã hết hạn hoặc đã xử lý. Hãy chạy lại lệnh.');
-        if (value.actorId !== interaction.user.id) throw new UserError('Chỉ người chạy lệnh mới được sử dụng nút này.');
-        if (value.kind === 'pages' && kind === 'page') {
+        if (kind === 'page') {
+          const value = pages.get(id!);
+          if (!value) throw new UserError('Yêu cầu đã hết hạn hoặc đã xử lý. Hãy chạy lại lệnh.');
+          if (value.actorId !== interaction.user.id) throw new UserError('Chỉ người chạy lệnh mới được sử dụng nút này.');
           const index = Number(page);
           if (!Number.isInteger(index) || index < 0 || index >= value.pages.length) throw new UserError('Trang không hợp lệ.');
           await interaction.update({ content: `${value.pages[index]}\nTrang ${index + 1}/${value.pages.length}`, components: pageComponents(id!, index, value.pages.length), allowedMentions: { parse: [] } });
           return;
         }
-        if (value.kind !== 'confirm' || !['confirm', 'cancel'].includes(kind!)) throw new UserError('Yêu cầu không hợp lệ.');
+        if (!['confirm', 'cancel'].includes(kind!)) throw new UserError('Yêu cầu không hợp lệ.');
+        const value = confirmations.get(id!);
+        if (!value) throw new UserError('Yêu cầu đã hết hạn hoặc đã xử lý. Hãy chạy lại lệnh.');
+        if (value.actorId !== interaction.user.id) throw new UserError('Chỉ người chạy lệnh mới được sử dụng nút này.');
         await admin(interaction);
         // Recheck expiry after the permission fetch; remove before any await to prevent double submission.
-        if (value.expires <= Date.now() || pending.get(id!) !== value) throw new UserError('Yêu cầu đã hết hạn hoặc đã xử lý.');
-        pending.delete(id!);
+        if (value.expires <= Date.now() || confirmations.get(id!) !== value) throw new UserError('Yêu cầu đã hết hạn hoặc đã xử lý.');
+        confirmations.delete(id!);
         await interaction.deferUpdate();
         if (kind === 'confirm') await relays.mutate(value.action, interaction.user.id);
         await interaction.editReply({ content: kind === 'confirm' ? 'Đã xóa cấu hình được chọn.' : 'Đã hủy thao tác.', components: [], allowedMentions: { parse: [] } });
@@ -191,7 +199,7 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
         await admin(interaction);
         if (!setSession) throw new UserError('Điều khiển phiên chưa sẵn sàng.');
         const running = interaction.commandName === 'start';
-        setSession(running);
+        await setSession(running);
         await respond(interaction, running
           ? 'Đã bật phiên. Bot đang kết nối các channel của group active; group paused được giữ nguyên. Xem /status để kiểm tra kết quả.'
           : 'Đã dừng phiên và ngắt voice của tất cả bots. Dùng /start để kết nối lại.');
@@ -257,5 +265,5 @@ export function createCommandHandler({ config, relays, status, leaders, onError,
       } catch (replyError) { onError(replyError); }
     }
   };
-  return { handle, stop() { accepting = false; pending.clear(); } };
+  return { handle, stop() { accepting = false; confirmations.clear(); pages.clear(); } };
 }

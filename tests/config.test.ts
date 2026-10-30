@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { loadConfig } from '../src/config.js';
+import { ConfigError, loadConfig } from '../src/config.js';
 import { retryDelay } from '../src/bot.js';
 import { safeError } from '../src/logger.js';
 
@@ -14,8 +14,12 @@ describe('configuration', () => {
     { BOT_TOKEN_1: '' }, { BOT_TOKEN_1: validEnv.BOT_TOKEN_2 }, { DATABASE_PATH: '' },
     { GUILD_ID: 'invalid' }, { DATABASE_PATH: ':memory:' }, { JITTER_BUFFER_MS: '45' }, { MAX_QUEUE_MS: '60' },
     { LEADER_ROLE_ID: undefined }, { LEADER_ROLE_ID: '' }, { LEADER_ROLE_ID: 'invalid' }, { MIX_SOURCE_GAIN: 'NaN' }, { ADMIN_ROLE_IDS: 'invalid' },
-  ])('rejects invalid config %j', override => {
-    expect(() => loadConfig({ ...validEnv, ...override })).toThrow();
+  ])('rejects invalid config %j with safe ConfigError message', override => {
+    let caught: unknown;
+    try { loadConfig({ ...validEnv, ...override }); }
+    catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as Error).message).not.toContain('secret-token');
   });
   it('starts without database service or channel environment variables', () => {
     const config = loadConfig({ GUILD_ID: validEnv.GUILD_ID, LEADER_ROLE_ID: validEnv.LEADER_ROLE_ID, BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c' });

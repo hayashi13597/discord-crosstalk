@@ -109,6 +109,24 @@ describe('group runtime reconciliation', () => {
     runtime.apply(snapshot);
     expect(mocks.workers.get(4)!.configure.mock.calls.at(-1)![3]).toBe(false);
   });
+  it('restores persisted running session from snapshot on startup while keeping paused groups disconnected', () => {
+    vi.useFakeTimers();
+    const runtime = new RelayRuntime(config, { error: vi.fn() } as unknown as Logger, vi.fn(), vi.fn());
+    active.push(runtime);
+    const snapshot = structuredClone(initial);
+    snapshot.groups[1]!.state = 'paused';
+    snapshot.session = true;
+    runtime.apply(snapshot);
+    expect(runtime.sessionRunning).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+    for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure.mock.calls.at(-1)![3]).toBe(true);
+    for (const id of [4, 5, 6]) expect(mocks.workers.get(id)!.configure.mock.calls.at(-1)![3]).toBe(false);
+
+    runtime.apply({ ...snapshot, session: false });
+    expect(runtime.sessionRunning).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    for (const id of [1, 2, 3]) expect(mocks.workers.get(id)!.configure.mock.calls.at(-1)![3]).toBe(false);
+  });
   it('starts all configured gateways and drains them on shutdown', async () => {
     const { runtime } = setup();
     runtime.start();

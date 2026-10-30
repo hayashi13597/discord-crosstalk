@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, ChannelType, PermissionFlagsBits, type Interaction } from 'discord.js';
+import { Client, Events, GatewayIntentBits, ChannelType, Options, PermissionFlagsBits, type Interaction } from 'discord.js';
 import { entersState, EndBehaviorType, joinVoiceChannel, VoiceConnectionStatus,
   type AudioReceiveStream, type VoiceConnection } from '@discordjs/voice';
 import type { Logger } from 'pino';
@@ -41,6 +41,30 @@ export interface WorkerOptions {
   active: boolean;
   onIdentity: (userId: string) => Promise<void>;
 }
+
+const workerCacheFactory = Options.cacheWithLimits({
+  ApplicationCommandManager: 0,
+  ApplicationEmojiManager: 0,
+  AutoModerationRuleManager: 0,
+  BaseGuildEmojiManager: 0,
+  DMMessageManager: 0,
+  EntitlementManager: 0,
+  GuildBanManager: 0,
+  GuildEmojiManager: 0,
+  GuildForumThreadManager: 0,
+  GuildInviteManager: 0,
+  GuildMessageManager: 0,
+  GuildScheduledEventManager: 0,
+  GuildStickerManager: 0,
+  GuildTextThreadManager: 0,
+  MessageManager: 0,
+  PresenceManager: 0,
+  ReactionManager: 0,
+  ReactionUserManager: 0,
+  StageInstanceManager: 0,
+  ThreadManager: 0,
+  ThreadMemberManager: 0,
+});
 
 export class TeamBot<T extends string | number = number> {
   private currentClient: Client;
@@ -94,8 +118,11 @@ export class TeamBot<T extends string | number = number> {
   }
 
   private createClient(): Client {
-    const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
-      rest: { timeout: 15000 } });
+    const client = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
+      makeCache: workerCacheFactory,
+      rest: { timeout: 15000 },
+    });
     const active = () => this.currentClient === client && !this.stopped;
     const error = (error: Error) => { if (active()) this.recordError(error); };
     const disconnected = () => {

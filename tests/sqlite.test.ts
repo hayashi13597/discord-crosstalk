@@ -20,10 +20,13 @@ async function setup() {
   const config = loadConfig({ GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'one', BOT_TOKEN_2: 'two', BOT_TOKEN_3: 'three' });
   return { db, directory, config, relays: new SqliteRelays(db, config), moves: new SqliteVoiceMoves(db) };
 }
-it('migrates idempotently and persists command-configured channels with workers 1–3', async () => {
+it('migrates idempotently, configures WAL + synchronous NORMAL, and persists channels with workers 1–3', async () => {
   const { db, relays } = await setup();
   await db.migrate();
+  expect((await db.query('PRAGMA journal_mode')).rows[0]).toMatchObject({ journal_mode: 'wal' });
+  expect((await db.query('PRAGMA synchronous')).rows[0]).toMatchObject({ synchronous: 1 });
   const initial = await relays.initialize();
+  expect(initial.session).toBe(false);
   expect(initial.groups).toEqual([expect.objectContaining({ name: 'Group A', state: 'active', legacy: true })]);
   expect(initial.teams).toEqual([]);
   const groupId = initial.groups[0]!.id;
@@ -35,6 +38,26 @@ it('migrates idempotently and persists command-configured channels with workers 
   await expect(relays.mutate({ kind: 'team.add', groupId, channelId: 'channel-one' }, 'actor')).rejects.toThrow('đã được gán');
   expect((await relays.initialize()).teams).toHaveLength(1);
   expect((await db.query('SELECT * FROM relay_audit')).rows).toHaveLength(2);
+});
+it('persists session state across restarts and prunes relay_audit entries older than 90 days', async () => {
+  const { db, directory, config, relays } = await setup();
+  await db.migrate();
+  await expect(relays.setSession(true)).rejects.toThrow('not initialized');
+  expect((await relays.initialize()).session).toBe(false);
+  expect((await relays.setSession(true)).session).toBe(true);
+  const reopened = new LocalDatabase(join(directory, 'bot.sqlite'));
+  try {
+    await reopened.migrate();
+    const restarted = new SqliteRelays(reopened, config);
+    expect((await restarted.initialize()).session).toBe(true);
+    expect((await restarted.setSession(false)).session).toBe(false);
+  } finally { await reopened.end(); }
+  expect((await relays.initialize()).session).toBe(false);
+
+  await db.query("INSERT INTO relay_audit(guild_id,actor_id,action,details,changed_at) VALUES($1,'actor','old','{}','2000-01-01T00:00:00.000Z')", [config.guildId]);
+  await relays.prune();
+  const audits = (await db.query('SELECT action FROM relay_audit WHERE guild_id=$1', [config.guildId])).rows;
+  expect(audits).toEqual([{ action: 'guild.initialize' }]);
 });
 it('serializes transactions and rolls back failed writes', async () => {
   const { db } = await setup();
@@ -76,14 +99,25 @@ it('finishes successful and cancelled moves with JSON and timestamps intact', as
   await moves.create({ ...input, id: 'cancelled' }, 'user_cancelled');
   expect(await moves.get('cancelled', 'guild')).toMatchObject({ status: 'Cancelled', members: [{ status: 'skipped' }, { status: 'skipped' }] });
 });
-it('rejects a second local instance and allows handoff after release', async () => {
-  const { db } = await setup();
+it('rejects a second local instance even while an initial exclusive lock is held, and allows handoff after release', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'crosstalk-lease-'));
+  cleanup.push(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'bot.sqlite');
+  const firstDb = new LocalDatabase(path);
+  cleanup.push(() => firstDb.end());
   const lost = vi.fn();
-  const first = new LocalInstanceLease(db, lost);
-  const second = new LocalInstanceLease(db, lost);
+  const first = new LocalInstanceLease(firstDb, lost);
   await first.acquire();
   cleanup.push(() => first.release());
+  const holder = new DatabaseSync(path);
+  cleanup.push(async () => holder.close());
+  holder.exec('BEGIN EXCLUSIVE; CREATE TABLE locked_check(x);');
+  // Constructing LocalDatabase before lease.acquire() must not fail with SQLITE_BUSY on disk pragmas.
+  const secondDb = new LocalDatabase(path);
+  cleanup.push(() => secondDb.end());
+  const second = new LocalInstanceLease(secondDb, lost);
   await expect(second.acquire()).rejects.toThrow();
+  holder.exec('ROLLBACK');
   await first.release();
   await second.acquire();
   await second.release();
@@ -140,12 +174,15 @@ it('upgrades the previous SQLite schema without losing channel mappings or move 
   expect((await db.query('SELECT * FROM relay_teams')).rows).toEqual([
     { id: 'team', guild_id: 'guild', group_id: 'group', channel_id: 'saved-channel', worker_id: 1 },
   ]);
+  expect((await db.query('SELECT session_running FROM relay_guilds')).rows).toEqual([{ session_running: 0 }]);
   expect((await db.query('SELECT * FROM relay_workers')).rows[0]).toMatchObject({ user_id: 'verified-bot' });
   expect((await db.query('SELECT * FROM relay_audit')).rows).toHaveLength(1);
   expect(await moves.get(input.id, 'guild')).toEqual(savedJob);
   expect((await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('leader_assignments','leader_audit')")).rows).toEqual([]);
   expect((await db.query('PRAGMA foreign_key_check')).rows).toEqual([]);
-  expect((await db.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+  expect((await db.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([
+    { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+  ]);
 });
 
 it('persists and replaces default move destinations per guild across database connections', async () => {

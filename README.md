@@ -2,7 +2,7 @@
 
 Ứng dụng Node.js + TypeScript dùng nhiều Discord bot account để chuyển giọng của leader giữa các voice team trong cùng group. Leader là thành viên có role `LEADER_ROLE_ID` đang trong channel của team; member nói nội bộ. Không chuyển audio sang group khác hoặc phát ngược về channel nguồn.
 
-Bot dùng **SQLite local**, không cần PostgreSQL service. Khởi động ứng dụng chỉ đăng nhập gateway để nhận lệnh; **luôn chờ `/start` trước khi vào voice**, kể cả sau restart.
+Bot dùng **SQLite local**, không cần PostgreSQL service. Với DB mới hoặc sau khi `/stop`, khởi động ứng dụng chỉ đăng nhập gateway để nhận lệnh và **chờ `/start` trước khi vào voice**; nếu phiên đang `/start` khi tiến trình restart/redeploy hoặc crash, bot tự khôi phục phiên cho các group `active` (giữ nguyên group `paused`).
 
 ## Chạy local
 
@@ -46,8 +46,8 @@ Chỉ Bot 1 nhận và xử lý commands; gateway vẫn online khi chưa start h
 | Lệnh | Hành vi |
 | --- | --- |
 | `/help` | Xem tất cả lệnh, tham số và quyền sử dụng |
-| `/start` | Bật phiên cho tất cả group active, giữ nguyên group paused; xem `/status` để biết kết nối thực tế |
-| `/stop` | Ngắt toàn bộ voice/audio và reconnect, giữ gateway online |
+| `/start` | Bật và lưu phiên cho tất cả group active, giữ nguyên group paused; xem `/status` để biết kết nối thực tế |
+| `/stop` | Ngắt toàn bộ voice/audio và reconnect, lưu trạng thái dừng, giữ gateway online |
 | `/status` | Sức khỏe SQLite, trạng thái phiên, groups và workers |
 | `/group create name:Bravo` | Tạo group paused |
 | `/group list` | Liệt kê groups |
@@ -66,7 +66,7 @@ Chỉ Bot 1 nhận và xử lý commands; gateway vẫn online khi chưa start h
 | `/voice move-all` | Chuyển ngay theo cấu hình nguồn/đích đã lưu |
 | `/voice move-status job:<id>` | Xem tiến độ và lịch sử tác vụ |
 
-Đổi channel bằng `/team remove` rồi `/team add`. Xác nhận xóa hết hạn sau 60 giây, chỉ người chạy lệnh dùng được. Cấu hình channel/team, trạng thái active/paused và worker assignments tồn tại sau restart. Trạng thái phiên start không được lưu. Trong phiên đã start, bot tự reconnect khi mất kết nối tạm thời. Gọi start/stop lặp lại không tạo kết nối trùng.
+Đổi channel bằng `/team remove` rồi `/team add`. Xác nhận xóa hết hạn sau 60 giây, chỉ người chạy lệnh dùng được. Cấu hình channel/team, trạng thái active/paused, worker assignments và trạng thái phiên (`/start` / `/stop`) đều được lưu trong SQLite qua restart. Trong phiên đã start, bot tự reconnect khi mất kết nối tạm thời hoặc khi container restart. Gọi start/stop lặp lại không tạo kết nối trùng.
 
 ## Di chuyển hàng loạt người trong voice
 
@@ -80,11 +80,11 @@ Không có nút hủy hay undo khi job đã chạy. Thay đổi cấu hình áp 
 
 Mỗi guild chỉ có một job chạy. Bot chụp danh sách ban đầu rồi quét lại các nguồn sau mỗi vòng để bổ sung người mới vào và người quay lại nguồn. Chỉ chuyển người còn trong một nguồn đã cấu hình khi kiểm tra; người đã rời nguồn/ở đích được bỏ qua. Mọi bot account luôn bị bỏ qua. Leader và member được xử lý như nhau, không phụ thuộc Relay Group; leader rời channel team sẽ ngừng được thu theo logic relay hiện có. Không sửa mapping team/group/leader hoặc kết nối bot.
 
-Job xử lý tuần tự, tối đa **5 vòng**, **3 lần thử mỗi người**, trong **2 phút** kể từ khi job được lưu (yêu cầu đang gửi có thể cần thêm thời gian để kết thúc). Lỗi tạm thời được thử lại với thời gian chờ; rate limit tuân theo thời gian Discord trả về. Trước mỗi lần gửi lại, bot đọc vị trí voice hiện tại: đã ở đích hoặc đã rời nguồn thì không gửi PATCH. Timeout/5xx sau khi gửi được ghi `unknown`; bot không thử lại PATCH nếu chưa đọc được vị trí mới. Lỗi riêng của một người không ngăn xử lý những người còn lại. Mất quyền, kênh không khả dụng, đích đầy, mất gateway, lỗi audit hoặc cập nhật tiến độ vẫn dừng job.
+Job xử lý tuần tự, tối đa **5 vòng**, **3 lần thử mỗi người**, trong **2 phút** kể từ khi job được lưu (yêu cầu đang gửi có thể cần thêm thời gian để kết thúc). Lỗi tạm thời được thử lại với thời gian chờ; rate limit tuân theo thời gian Discord trả về. Trước mỗi lần gửi lại, bot đọc vị trí voice hiện tại: đã ở đích hoặc đã rời nguồn thì không gửi PATCH. Timeout/5xx sau khi gửi được ghi `unknown`; bot không thử lại PATCH nếu chưa đọc được vị trí mới. Lỗi riêng của một người không ngăn xử lý những người còn lại. Mất quyền, kênh không khả dụng, đích đầy, mất gateway, lỗi audit hoặc lỗi gửi tiến độ bất thường vẫn dừng job (riêng trường hợp người gọi tự đóng tin nhắn tiến độ ephemeral hoặc hết hạn interaction token thì job vẫn tiếp tục hoàn tất và xem lại qua `/voice move-status`).
 
 Chỉ báo **đã chuyển hết người thật khỏi nguồn** sau hai lần quét không còn người/chưa xác minh, cách nhau một giây. Đây là trạng thái tại lần kiểm tra cuối; người vẫn có thể vào lại sau đó. Nguồn ban đầu trống vẫn được kiểm tra và có thể hoàn tất mà không chuyển ai. Nếu còn người, hết giới hạn hoặc không xác minh được, kết quả ghi rõ tình trạng và Job ID; `/voice move-status` có danh sách còn ở nguồn, chưa xác minh và kết quả từng người. Thời điểm kiểm tra được lưu trong SQLite; nếu job dừng trước khi kiểm tra được, bot không tuyên bố nguồn đã trống. Không rollback. Kết quả `unknown` được tính trong thất bại/chưa rõ, không tuyên bố đã chuyển thành công. Bot không cố vượt giới hạn channel dù có quyền quản trị.
 
-Schema SQLite tạo `voice_move_jobs` và `voice_move_members`, lưu snapshot, người gọi/guild, nguồn/đích, thời gian và kết quả từng người. Lịch sử `Cancelled` từ phiên bản dùng bảng chọn vẫn xem được. Bản ghi kết thúc được giữ **90 ngày**, dọn khi khởi động và hằng ngày; job đang chạy không bị dọn. Không lưu interaction token, nội dung hội thoại hoặc audio. Xem lại bằng `/voice move-status job:<id>` với cùng quyền quản trị, kể cả sau restart hoặc khi webhook ephemeral hết hạn.
+Schema SQLite tạo `voice_move_jobs` và `voice_move_members`, lưu snapshot, người gọi/guild, nguồn/đích, thời gian và kết quả từng người. Lịch sử `Cancelled` từ phiên bản dùng bảng chọn vẫn xem được. Bản ghi kết thúc (cùng lịch sử `relay_audit`) được giữ **90 ngày**, dọn khi khởi động và hằng ngày; job đang chạy không bị dọn. Không lưu interaction token, nội dung hội thoại hoặc audio. Xem lại bằng `/voice move-status job:<id>` với cùng quyền quản trị, kể cả sau restart hoặc khi webhook ephemeral hết hạn.
 
 Sau restart, job dang dở được đánh dấu `Interrupted` sau khi lấy instance lease; giữ kết quả đã lưu, đánh dấu lượt đang xử lý là `unknown` và các lượt chưa chạy là thất bại do gián đoạn. Không tự chạy lại. Quản trị viên đối chiếu trạng thái Discord/kết quả từng người trước khi mở tác vụ mới. Mất database trong lúc ghi kết quả dừng các lượt tiếp theo; nếu chưa thể ghi trạng thái kết thúc, job vẫn khóa guild cho tới khi phục hồi lúc restart.
 
@@ -92,7 +92,7 @@ API không có thao tác nguyên tử “chỉ chuyển nếu user vẫn ở ngu
 
 ## Database và vận hành
 
-`DATABASE_PATH` mặc định `./data/crosstalk.sqlite`, được resolve theo working directory. Bot tự tạo thư mục/schema, bật foreign keys và WAL. Không cấu hình `:memory:` cho bot. Các biến audio (`JITTER_BUFFER_MS=60`, `MAX_QUEUE_MS=200`, `SINGLE_SOURCE_GAIN=1`, `MIX_SOURCE_GAIN=0.5`) và `LOG_LEVEL=info` giữ mặc định như `.env.example`.
+`DATABASE_PATH` mặc định `./data/crosstalk.sqlite`, được resolve theo working directory. Bot tự tạo thư mục/schema (quyền `0700` trên hệ thống POSIX), bật foreign keys và WAL (`synchronous = NORMAL`). Không cấu hình `:memory:` cho bot. Các biến audio (`JITTER_BUFFER_MS=60`, `MAX_QUEUE_MS=200`, `SINGLE_SOURCE_GAIN=1`, `MIX_SOURCE_GAIN=0.5`) và `LOG_LEVEL=info` giữ mặc định như `.env.example`.
 
 Bot chỉ dùng SQLite và được điều khiển qua Discord commands. Migration tự động bỏ bảng phân công leader cũ, giữ nguyên groups, channel, worker assignments và lịch sử relay/voice-move.
 
@@ -108,7 +108,7 @@ Chạy trực tiếp bằng Node.js theo hướng dẫn ở trên (`npm run buil
 4. Thêm Variables theo `.env.example`: `BOT_TOKEN_1`, `BOT_TOKEN_2`, `BOT_TOKEN_3`, `GUILD_ID`, `LEADER_ROLE_ID`; thêm tokens worker và `ADMIN_ROLE_IDS` nếu cần. Không commit `.env`.
 5. Chạy **một replica, một region**, tắt Serverless/sleep. Đặt restart policy On Failure, `RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=0` và `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15`. Bot không có HTTP server: không cấu hình HTTP healthcheck hoặc public domain.
 6. Deploy và xem logs. Bot tự migrate DB và đăng ký commands bằng Bot 1 khi gateway sẵn sàng; không chạy migration trong pre-deploy vì volume chỉ có khi runtime start. Dừng bot local nếu dùng cùng bộ tokens trước khi chạy Railway.
-7. Trên Discord: `/team add` cho các channel nếu DB mới → `/start` → `/status`. Sau mỗi restart/redeploy phải gọi `/start` lại.
+7. Trên Discord: `/team add` cho các channel nếu DB mới → `/start` → `/status`. Phiên đã `/start` được lưu trong volume SQLite và tự khôi phục sau restart/redeploy (dùng `/stop` khi muốn ngắt hẳn phiên).
 
 Tham khảo: [Railpack Node.js](https://railpack.com/languages/node/), [Railway Volumes](https://docs.railway.com/volumes), [Railway deployment lifecycle](https://docs.railway.com/deployments/reference).
 
@@ -121,4 +121,4 @@ npm run test:integration
 
 Integration tests SQLite dùng file tạm, không cần database service. Chúng kiểm tra migration, lưu channel/worker, rollback, phục hồi voice-move, retention và khóa instance.
 
-Cần nghiệm thu thủ công trên Discord test server: cấu hình channel → start → pause/resume → stop → restart; đảm bảo restart không tự vào voice, group paused không bị start, và chỉ leader được relay đúng group. Kiểm tra thiếu quyền channel, hết worker, mất kết nối và Mass Voice Move. Automated tests không thay thế kiểm tra audio thực tế.
+Cần nghiệm thu thủ công trên Discord test server: cấu hình channel → start → pause/resume → restart (tự khôi phục group active, group paused vẫn nghỉ) → stop → restart (đảm bảo sau `/stop` thì restart không tự vào voice), và chỉ leader được relay đúng group. Kiểm tra thiếu quyền channel, hết worker, mất kết nối và Mass Voice Move. Automated tests không thay thế kiểm tra audio thực tế.

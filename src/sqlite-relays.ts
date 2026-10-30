@@ -26,10 +26,15 @@ export class SqliteRelays implements RelayRepository {
   }
 
   private async load(client: LocalClient): Promise<RelaySnapshot> {
+    const guild = await client.query('SELECT session_running FROM relay_guilds WHERE guild_id = $1', [this.config.guildId]);
     const groups = await client.query('SELECT id, name, state, legacy FROM relay_groups WHERE guild_id = $1 ORDER BY legacy DESC, id', [this.config.guildId]);
     const teams = await client.query(`SELECT id, group_id AS "groupId", channel_id AS "channelId",
       worker_id AS "workerId" FROM relay_teams WHERE guild_id = $1 ORDER BY worker_id`, [this.config.guildId]);
-    return { groups: groups.rows.map(row => ({ ...row, legacy: Boolean(row.legacy) })), teams: teams.rows };
+    return {
+      groups: groups.rows.map(row => ({ ...row, legacy: Boolean(row.legacy) })),
+      teams: teams.rows,
+      session: Boolean(guild.rows[0]?.session_running),
+    };
   }
 
   initialize(): Promise<RelaySnapshot> {
@@ -50,6 +55,18 @@ export class SqliteRelays implements RelayRepository {
 
   async healthy(): Promise<boolean> {
     try { await this.pool.query('SELECT 1'); return true; } catch { return false; }
+  }
+
+  setSession(running: boolean): Promise<RelaySnapshot> {
+    return this.transaction(async client => {
+      const updated = await client.query('UPDATE relay_guilds SET session_running = $2 WHERE guild_id = $1', [this.config.guildId, running ? 1 : 0]);
+      if (updated.rowCount !== 1) throw new Error('Relay guild is not initialized');
+      return this.load(client);
+    });
+  }
+
+  async prune(): Promise<void> {
+    await this.pool.query("DELETE FROM relay_audit WHERE guild_id = $1 AND changed_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-90 days')", [this.config.guildId]);
   }
 
   async identify(workerId: number, userId: string): Promise<void> {

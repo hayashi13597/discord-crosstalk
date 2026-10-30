@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChannelType, DiscordAPIError, PermissionFlagsBits, RateLimitError } from 'discord.js';
 import { createMoveRest, DiscordMoveGateway, requireMoveAdmin } from '../src/voice-move-discord.js';
-import { discordHarness, moveInput } from './voice-move-helpers.js';
+import { VoiceMoveService } from '../src/voice-moves.js';
+import { discordHarness, MemoryMoves, moveInput } from './voice-move-helpers.js';
+
+afterEach(() => vi.useRealTimers());
 
 describe('Discord mass move eligibility', () => {
   it('snapshots all selected sources, excludes every bot, and includes leaders regardless of group', async () => {
@@ -62,6 +65,113 @@ describe('Discord mass move eligibility', () => {
     expect(state.patch).not.toHaveBeenCalled();
     expect(state.get).toHaveBeenCalledWith('/guilds/guild/voice-states/human', expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(state.rawGuild.voiceStates.fetch).not.toHaveBeenCalled();
+  });
+  it('moves a member verified in source via REST even when gateway voice cache lags, yet skips on real-time departure during checks', async () => {
+    const state = discordHarness();
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    // Simulate a late arrival discovered via REST whose gateway voiceStates.cache entry has not arrived yet.
+    state.cache.delete('human');
+    state.positions.set('human', 'a');
+    expect(await gateway.move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal))
+      .toEqual({ status: 'moved', reason: null });
+    expect(state.patch).toHaveBeenCalledOnce();
+
+    // Now simulate a real-time gateway VoiceStateUpdate departing source 'a' while REST/permission checks are in flight.
+    state.patch.mockClear();
+    state.cache.set('human', { id: 'human', channelId: 'a' });
+    state.positions.set('human', 'a');
+    state.get.mockImplementationOnce(async () => {
+      state.cache.set('human', { id: 'human', channelId: null });
+      return { channel_id: 'a' };
+    });
+    expect(await gateway.move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal))
+      .toEqual({ status: 'skipped', reason: 'left_sources' });
+    expect(state.patch).not.toHaveBeenCalled();
+  });
+  it('reuses preflight validation and gateway caches across snapshot, move, and scan without REST storms', async () => {
+    const state = discordHarness();
+    const cachedGuild = Object.assign(state.rawGuild, {
+      roles: { ...state.rawGuild.roles, cache: new Map([['role1', { id: 'role1' }]]) },
+      members: { ...state.rawGuild.members, me: { id: 'bot1' }, cache: state.members },
+      channels: { ...state.rawGuild.channels, cache: state.channels },
+    });
+    const gateway = new DiscordMoveGateway(cachedGuild as unknown as typeof state.guild, state.rest);
+    const snapshot = await gateway.snapshot('admin', ['a', 'b'], 'd');
+    const input = { ...moveInput(0), sources: snapshot.sources, destinationId: snapshot.destinationId,
+      members: snapshot.members, snapshotAt: snapshot.takenAt };
+    state.rawGuild.roles.fetch.mockClear();
+    state.rawGuild.channels.fetch.mockClear();
+    state.rawGuild.members.fetchMe.mockClear();
+    state.rawGuild.members.fetch.mockClear();
+
+    await gateway.validate(input);
+    expect(state.rawGuild.roles.fetch).not.toHaveBeenCalled();
+    expect(state.rawGuild.channels.fetch).not.toHaveBeenCalled();
+    expect(state.rawGuild.members.fetchMe).not.toHaveBeenCalled();
+    expect(state.rawGuild.members.fetch).not.toHaveBeenCalled();
+
+    const signal = new AbortController().signal;
+    expect(await gateway.move({ userId: 'human', sourceId: 'a' }, input, signal)).toEqual({ status: 'moved', reason: null });
+    expect(await gateway.move({ userId: 'leader', sourceId: 'b' }, input, signal)).toEqual({ status: 'moved', reason: null });
+    await gateway.scan(input, signal);
+
+    expect(state.rawGuild.channels.fetch).not.toHaveBeenCalled();
+    expect(state.rawGuild.members.fetchMe).not.toHaveBeenCalled();
+    expect(state.rawGuild.roles.fetch).not.toHaveBeenCalled();
+    // Only the caller ('admin') permission check in scan() fetches fresh member state; occupants hit botUsers/members.cache.
+    expect(state.rawGuild.members.fetch).toHaveBeenCalledExactlyOnceWith({ user: 'admin', force: true });
+
+    // If a verified channel is evicted from channels.cache mid-job, fallback confirms via forced REST fetch before failing.
+    const channelA = state.channels.get('a')!;
+    const channelCache = new Map(state.channels);
+    channelCache.delete('a');
+    cachedGuild.channels.cache = channelCache;
+    state.positions.set('human', 'a');
+    expect(await gateway.move({ userId: 'human', sourceId: 'a' }, input, signal)).toEqual({ status: 'moved', reason: null });
+    expect(state.rawGuild.channels.fetch).toHaveBeenCalledExactlyOnceWith('a', { force: true });
+    expect(channelA.permissionsFor).toHaveBeenCalled();
+  });
+  it('rejects before moving anyone when caller permissions are revoked during occupant verification or after preflight expires', async () => {
+    vi.useFakeTimers();
+    const state = discordHarness();
+    const originalMembersFetch = state.rawGuild.members.fetch.getMockImplementation()!;
+    const originalChannelsFetch = state.rawGuild.channels.fetch.getMockImplementation()!;
+
+    // Fast occupant verification (< 2s): caller loses MoveMembers mid-snapshot.
+    state.rawGuild.members.fetch.mockImplementation(async options => {
+      if (options.user === 'human') state.permissions.delete(PermissionFlagsBits.MoveMembers);
+      return originalMembersFetch(options);
+    });
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    const service = new VoiceMoveService(new MemoryMoves(), vi.fn());
+    await expect(gateway.snapshot('admin', ['a', 'b'], 'd')).rejects.toThrow('Move Members');
+    await expect(service.run(moveInput(), gateway, vi.fn())).rejects.toThrow('Move Members');
+    expect(state.patch).not.toHaveBeenCalled();
+
+    // Slow occupant verification (>= 2s) + slow channel recheck: preflight age tracks actual caller check,
+    // so validate() re-checks caller permissions before moving the first member.
+    state.permissions.add(PermissionFlagsBits.MoveMembers);
+    const slowGateway = new DiscordMoveGateway(state.guild, state.rest);
+    let refreshedAfterOccupants = false;
+    state.rawGuild.members.fetch.mockImplementation(async options => {
+      if (options.user === 'human') {
+        vi.advanceTimersByTime(3000);
+        refreshedAfterOccupants = true;
+      }
+      return originalMembersFetch(options);
+    });
+    state.rawGuild.channels.fetch.mockImplementation(async id => {
+      if (refreshedAfterOccupants && id === 'd') {
+        vi.advanceTimersByTime(2500);
+        state.permissions.delete(PermissionFlagsBits.ManageGuild);
+      }
+      return originalChannelsFetch(id);
+    });
+    const snapshot = await slowGateway.snapshot('admin', ['a', 'b'], 'd');
+    const input = { ...moveInput(0), sources: snapshot.sources, destinationId: snapshot.destinationId,
+      members: snapshot.members, snapshotAt: snapshot.takenAt };
+    await expect(service.run(input, slowGateway, vi.fn())).rejects.toThrow('Move Members');
+    expect(state.patch).not.toHaveBeenCalled();
   });
   it('does not move bots, and never mutates the voice cache used by relay leaders', async () => {
     const state = discordHarness();
@@ -133,9 +243,14 @@ describe('Discord mass move eligibility', () => {
   });
   it('classifies Discord rejections without disclosing raw responses', async () => {
     const state = discordHarness();
-    state.patch.mockRejectedValue(new DiscordAPIError({ code: 50013, message: 'missing permission' }, 50013, 403, 'PATCH', '/route', {}));
+    state.patch.mockRejectedValueOnce(new DiscordAPIError({ code: 50013, message: 'missing permission' }, 50013, 403, 'PATCH', '/route', {}));
     expect(await new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal))
       .toEqual({ status: 'failed', reason: 'missing_permissions' });
+    state.patch.mockRejectedValueOnce(new DiscordAPIError({ code: 10003, message: 'Unknown Channel' }, 10003, 404, 'PATCH', '/route', {}));
+    expect(await new DiscordMoveGateway(state.guild, state.rest).move({ userId: 'human', sourceId: 'a' }, moveInput(), new AbortController().signal))
+      .toEqual({ status: 'failed', reason: 'channel_unavailable' });
+    state.rawGuild.channels.fetch.mockRejectedValueOnce(new DiscordAPIError({ code: 10003, message: 'Unknown Channel' }, 10003, 404, 'GET', '/channels/deleted', {}));
+    await expect(new DiscordMoveGateway(state.guild, state.rest).snapshot('admin', ['deleted'], 'd')).rejects.toThrow('không tồn tại');
   });
   it('rechecks position after a lost PATCH response and never resends if already at destination', async () => {
     const state = discordHarness();
@@ -203,5 +318,4 @@ describe('Discord mass move eligibility', () => {
       .toMatchObject({ status: 'failed', reason: 'destination_full' });
     expect(state.patch).not.toHaveBeenCalled();
   });
-
 });

@@ -19,6 +19,7 @@ export class RelayRuntime {
   setSession(running: boolean): void {
     if (this.stopped || running === this.session) return;
     this.session = running;
+    if (this.snapshot.session !== undefined) this.snapshot.session = running;
     this.apply(this.snapshot);
   }
   constructor(private config: Config, private log: Logger, onInteraction: (interaction: Interaction) => void,
@@ -35,6 +36,7 @@ export class RelayRuntime {
     if (this.stopped) return;
     const old = this.snapshot;
     this.snapshot = structuredClone(snapshot);
+    if (snapshot.session !== undefined) this.session = snapshot.session;
     const changed = new Set<string>();
     const signature = (group: RelayGroup) => JSON.stringify([this.session, group.state,
       snapshot.teams.filter(team => team.groupId === group.id).map(team => [team.id, team.channelId, team.workerId])]);
