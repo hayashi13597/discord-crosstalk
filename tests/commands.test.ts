@@ -80,7 +80,7 @@ describe('multi-group slash commands', () => {
       expect(text).toContain(command);
     }
     expect(text).toContain('Move Members');
-    expect(text).toContain('restart luôn chờ /start');
+    expect(text).toContain('tự khôi phục sau restart');
     expect(state.fetch).not.toHaveBeenCalled();
     expect(state.mutate).not.toHaveBeenCalled();
     expect(state.setSession).not.toHaveBeenCalled();
@@ -141,6 +141,25 @@ describe('multi-group slash commands', () => {
     expect(state.mutate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'team.remove', teamId: 'a1', expected: expect.any(String) }), 'admin');
     await click.run();
     expect(state.mutate).toHaveBeenCalledTimes(1);
+  });
+  it('isolates pending admin confirmations from public pagination floods', async () => {
+    const state = await setup({ command: 'team', sub: 'remove', channel: initial.teams[0]!.channelId });
+    await state.run();
+    const id = state.confirmId();
+    state.status.mockResolvedValue('x'.repeat(4000));
+    for (let i = 0; i < 1050; i++) {
+      await state.handler.handle({
+        ...state.interaction,
+        commandName: 'status',
+        user: { id: 'ordinary-member' },
+        deferred: false,
+        replied: false,
+        deferReply: vi.fn(async () => {}),
+        editReply: vi.fn(async () => {}),
+      } as unknown as Interaction);
+    }
+    await state.button(id).run();
+    expect(state.mutate).toHaveBeenCalledOnce();
   });
   it('rejects expired confirmations, other users, and revoked permissions', async () => {
     const state = await setup({ command: 'team', sub: 'remove', channel: initial.teams[0]!.channelId });

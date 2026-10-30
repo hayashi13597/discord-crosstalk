@@ -1,9 +1,11 @@
-import { performance } from 'node:perf_hooks';
+import { endianness } from 'node:os';
 
 export const FRAME_MS = 20;
 export const FRAME_SAMPLES = 960;
 export const CHANNELS = 2;
-export const FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2;
+export const SAMPLE_COUNT = FRAME_SAMPLES * CHANNELS;
+export const FRAME_BYTES = SAMPLE_COUNT * 2;
+const IS_LITTLE_ENDIAN = endianness() === 'LE';
 
 export interface AudioSettings {
   jitterMs: number;
@@ -47,8 +49,20 @@ export class FrameQueue {
 
 export function mixFrames(frames: Buffer[], singleGain: number, mixGain: number): Buffer | undefined {
   if (!frames.length) return undefined;
-  const output = Buffer.alloc(FRAME_BYTES);
+  if (frames.length === 1 && singleGain === 1) return frames[0];
+  const output = Buffer.allocUnsafe(FRAME_BYTES);
   const gain = frames.length === 1 ? singleGain : mixGain;
+  if (IS_LITTLE_ENDIAN && output.byteOffset % 2 === 0 && frames.every(frame => frame.byteOffset % 2 === 0)) {
+    const views = frames.map(frame => new Int16Array(frame.buffer, frame.byteOffset, SAMPLE_COUNT));
+    const out = new Int16Array(output.buffer, output.byteOffset, SAMPLE_COUNT);
+    for (let i = 0; i < SAMPLE_COUNT; i++) {
+      let sample = 0;
+      for (let j = 0; j < views.length; j++) sample += views[j]![i]! * gain;
+      const rounded = Math.round(sample);
+      out[i] = rounded > 32767 ? 32767 : rounded < -32768 ? -32768 : rounded;
+    }
+    return output;
+  }
   for (let offset = 0; offset < FRAME_BYTES; offset += 2) {
     let sample = 0;
     for (const frame of frames) sample += frame.readInt16LE(offset) * gain;
@@ -67,10 +81,11 @@ export class AudioRouter<T extends string | number = number> {
   private epochs = new Map<T, number>();
   private outputs = new Map<T, Output>();
   private timer?: NodeJS.Timeout;
+  private running = false;
   private lastTick?: number;
 
   constructor(private channels: Record<T, string>, private settings: AudioSettings,
-    private clock: () => number = () => performance.now(), private onFault?: (error: unknown) => void) {
+    private clock: () => number = () => globalThis.performance.now(), private onFault?: (error: unknown) => void) {
     this.teamIds = Object.keys(channels).map(key => /^\d+$/.test(key) ? Number(key) : key) as T[];
   }
 
@@ -156,26 +171,66 @@ export class AudioRouter<T extends string | number = number> {
     }
     this.lastTick = now;
     const frames: [T, Buffer][] = [];
+    const activeTeams = new Set<T>();
     for (const [team, sources] of this.sources) for (const source of sources.values()) {
       const frame = source.queue.take(now);
-      if (frame) frames.push([team, frame]);
+      if (frame) {
+        frames.push([team, frame]);
+        activeTeams.add(team);
+      }
     }
+    if (!frames.length) {
+      for (const team of this.available) this.outputs.get(team)?.write(undefined);
+      return;
+    }
+    // Share PCM mixing across all listener teams receiving the same active sources,
+    // while each VoiceOutput encodes with its own continuous stateful Opus encoder.
+    let sharedAll: Buffer | undefined;
+    const allPcm = frames.map(([, pcm]) => pcm);
     for (const team of this.available) {
+      const output = this.outputs.get(team);
+      if (!output) continue;
+      if (!activeTeams.has(team)) {
+        sharedAll ??= mixFrames(allPcm, this.settings.singleGain, this.settings.mixGain);
+        output.write(sharedAll);
+        continue;
+      }
       const incoming = frames.filter(([source]) => source !== team).map(([, pcm]) => pcm);
-      this.outputs.get(team)?.write(mixFrames(incoming, this.settings.singleGain, this.settings.mixGain));
+      output.write(mixFrames(incoming, this.settings.singleGain, this.settings.mixGain));
     }
   }
 
   start(): void {
-    this.timer ??= setInterval(() => {
-      try { this.tick(); }
-      catch (error) {
+    if (this.running) return;
+    this.running = true;
+    let nextAt = this.clock() + FRAME_MS;
+    const step = () => {
+      this.timer = undefined;
+      if (!this.running) return;
+      try {
+        const now = this.clock();
+        if (now - nextAt > this.settings.maxQueueMs) {
+          this.tick();
+          nextAt = this.clock() + FRAME_MS;
+        } else {
+          while (this.running && this.clock() >= nextAt) {
+            this.tick();
+            nextAt += FRAME_MS;
+          }
+        }
+      } catch (error) {
         try { this.stop(); } finally { this.onFault?.(error); }
+        return;
       }
-    }, FRAME_MS);
+      if (!this.running) return;
+      const current = this.clock();
+      this.timer = setTimeout(step, Math.max(1, Math.ceil(nextAt - current)));
+    };
+    this.timer = setTimeout(step, FRAME_MS);
   }
   stop(): void {
-    clearInterval(this.timer);
+    this.running = false;
+    clearTimeout(this.timer);
     this.timer = undefined;
     this.sources.clear();
     this.available.clear();

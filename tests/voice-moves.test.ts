@@ -26,9 +26,10 @@ function setup(count = 3) {
   return { repository, errors, service, input, gateway, notify, run: () => settle(service.run(input, gateway, notify)) };
 }
 describe('durable mass voice move worker', () => {
-  it('persists before moving and requires two empty scans before completion', async () => {
+  it('persists before moving, skips redundant round-0 enqueue, and requires two empty scans before completion', async () => {
     const state = setup();
     await state.run();
+    expect(state.repository.enqueue).not.toHaveBeenCalled();
     expect(state.gateway.scan).toHaveBeenCalledTimes(2);
     expect(state.repository.jobs.get(state.input.id)).toMatchObject({ status: 'Completed', verification: { remaining: [], unverified: [] } });
     expect(state.notify).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'Completed' }));
@@ -125,18 +126,31 @@ describe('durable mass voice move worker', () => {
   });
   it.each(['enqueue', 'processing', 'outcome', 'verify'])('stops after an audit %s failure', async operation => {
     const state = setup();
+    if (operation === 'enqueue') {
+      vi.mocked(state.gateway.move).mockResolvedValueOnce({ status: 'failed', reason: 'discord_unavailable' });
+    }
     state.repository[operation as 'enqueue'].mockRejectedValueOnce(new Error('disk error'));
     await state.run();
     expect(state.repository.jobs.get(state.input.id)!.status).toBe('Interrupted');
-    if (operation === 'enqueue' || operation === 'processing') expect(state.gateway.move).not.toHaveBeenCalled();
-    if (operation === 'outcome') expect(state.gateway.move).toHaveBeenCalledOnce();
+    if (operation === 'processing') expect(state.gateway.move).not.toHaveBeenCalled();
+    if (operation === 'enqueue' || operation === 'outcome') expect(state.gateway.move).toHaveBeenCalledOnce();
   });
-  it('stops before any move when progress delivery fails', async () => {
+  it('stops before any move when progress delivery fails unexpectedly', async () => {
     const state = setup();
     state.notify.mockRejectedValueOnce(new Error('expired webhook'));
     await state.run();
     expect(state.gateway.move).not.toHaveBeenCalled();
     expect(state.repository.jobs.get(state.input.id)).toMatchObject({ status: 'Interrupted', reason: 'progress_delivery_failed' });
+  });
+  it.each([10008, 10062, 50027])('continues moving and completes when ephemeral progress reply is dismissed or expires (%s)', async code => {
+    const state = setup(3);
+    state.notify.mockRejectedValueOnce(Object.assign(new Error('Unknown Message'), { code }));
+    await state.run();
+    expect(state.gateway.move).toHaveBeenCalledTimes(3);
+    expect(state.gateway.scan).toHaveBeenCalledTimes(2);
+    expect(state.notify).toHaveBeenCalledOnce();
+    expect(state.errors).toHaveBeenCalledOnce();
+    expect(state.repository.jobs.get(state.input.id)).toMatchObject({ status: 'Completed', verification: { remaining: [], unverified: [] } });
   });
   it('aborts retry waits promptly on shutdown and refuses new work', async () => {
     const state = setup();
@@ -192,5 +206,4 @@ describe('durable mass voice move worker', () => {
     expect(state.gateway.scan).toHaveBeenCalledTimes(3);
     expect(state.repository.jobs.get(state.input.id)!.status).toBe('Completed');
   });
-
 });

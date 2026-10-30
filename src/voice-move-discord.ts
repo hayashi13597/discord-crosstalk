@@ -9,8 +9,8 @@ import type { MoveInput, MoveMember, MoveSnapshot } from './voice-move-types.js'
 export function createMoveRest(token: string): REST {
   return new REST({ version: '10', timeout: 5000, retries: 0, rejectOnRateLimit: () => true }).setToken(token);
 }
-export async function requireMoveAdmin(guild: Guild, actorId: string): Promise<void> {
-  await guild.roles.fetch();
+export async function requireMoveAdmin(guild: Guild, actorId: string, refreshRoles = true): Promise<void> {
+  if (refreshRoles || !guild.roles.cache?.size) await guild.roles.fetch();
   const actor = await guild.members.fetch({ user: actorId, force: true });
   if (!actor.permissions.has(PermissionFlagsBits.MoveMembers) ||
       !(actor.permissions.has(PermissionFlagsBits.ManageGuild) || actor.permissions.has(PermissionFlagsBits.Administrator))) {
@@ -26,6 +26,12 @@ class ChannelCheckError extends UserError {
 const arrivalReservations = new WeakMap<Guild, Map<string, string>>();
 export class DiscordMoveGateway implements MoveGateway {
   private arrivals: Map<string, string>;
+  // Account bot flag is immutable in Discord; cache across snapshot/move/scan to avoid N*4 member REST fetches.
+  private botUsers = new Map<string, boolean>();
+  private verifiedChannels = new Set<string>();
+  private preflightKey: string | null = null;
+  private preflightAt = 0;
+
   constructor(private guild: Guild, private rest: REST) {
     this.arrivals = arrivalReservations.get(guild) ?? new Map();
     arrivalReservations.set(guild, this.arrivals);
@@ -34,21 +40,44 @@ export class DiscordMoveGateway implements MoveGateway {
     return this.guild.available && this.guild.client.isReady() && this.guild.shard.status === Status.Ready;
   }
   private ensureReady() { if (!this.ready()) throw new MoveInterrupted('gateway_unavailable'); }
-  private async voiceChannel(id: string): Promise<VoiceChannel> {
-    const channel = await this.guild.channels.fetch(id, { force: true });
-    if (channel?.type !== ChannelType.GuildVoice || channel.guildId !== this.guild.id) {
+
+  private async isBot(userId: string): Promise<boolean> {
+    const known = this.botUsers.get(userId);
+    if (known !== undefined) return known;
+    const cached = this.guild.members.cache?.get(userId);
+    if (cached) {
+      this.botUsers.set(userId, cached.user.bot);
+      return cached.user.bot;
+    }
+    const member = await this.guild.members.fetch({ user: userId, force: true });
+    this.botUsers.set(userId, member.user.bot);
+    return member.user.bot;
+  }
+
+  private async voiceChannel(id: string, force = true): Promise<VoiceChannel> {
+    let channel: unknown = !force && this.verifiedChannels.has(id) ? this.guild.channels.cache?.get(id) : undefined;
+    if (!channel) {
+      const refresh = force || Boolean(this.verifiedChannels.has(id) && this.guild.channels.cache);
+      channel = await this.guild.channels.fetch(id, { force: refresh }).catch(error => {
+        if (error instanceof DiscordAPIError && Number(error.code) === 10003) return null;
+        throw error;
+      });
+      if (channel) this.verifiedChannels.add(id);
+      else this.verifiedChannels.delete(id);
+    }
+    if (!channel || (channel as VoiceChannel).type !== ChannelType.GuildVoice || (channel as VoiceChannel).guildId !== this.guild.id) {
       throw new ChannelCheckError(`Channel ${id} không tồn tại hoặc không phải voice channel thường trong server này. Hãy kiểm tra cấu hình rồi chạy lại /voice move-all.`, 'channel_unavailable');
     }
-    return channel;
+    return channel as VoiceChannel;
   }
   private occupancy(channelId: string) {
     for (const [id, destinationId] of this.arrivals) if (this.guild.voiceStates.cache.get(id)?.channelId === destinationId) this.arrivals.delete(id);
     return [...this.guild.voiceStates.cache.values()].filter(state => state.channelId === channelId).length +
       [...this.arrivals.values()].filter(destinationId => destinationId === channelId).length;
   }
-  private async permissions(sourceIds: string[], destinationId: string) {
-    const me = await this.guild.members.fetchMe({ force: true });
-    const destination = await this.voiceChannel(destinationId);
+  private async permissions(sourceIds: string[], destinationId: string, force = true) {
+    const me = (!force && this.guild.members.me) ? this.guild.members.me : await this.guild.members.fetchMe({ force });
+    const destination = await this.voiceChannel(destinationId, force);
     const check = (channel: VoiceChannel, label: string) => {
       const permissions = channel.permissionsFor(me);
       const required = [[PermissionFlagsBits.ViewChannel, 'View Channel'], [PermissionFlagsBits.Connect, 'Connect'], [PermissionFlagsBits.MoveMembers, 'Move Members']] as const;
@@ -57,19 +86,26 @@ export class DiscordMoveGateway implements MoveGateway {
     };
     check(destination, 'channel đích');
     for (const id of sourceIds) {
-      const source = await this.voiceChannel(id);
+      const source = await this.voiceChannel(id, force);
       // Connect is also required by Discord's fresh voice-state GET endpoint.
       check(source, `nguồn ${id}`);
     }
     return destination;
+  }
+  private signatureFor(actorId: string, destinationId: string, sourceIds: string[]): string {
+    return JSON.stringify([actorId, destinationId, sourceIds]);
   }
   async validate(input: MoveInput): Promise<void> {
     this.ensureReady();
     if (input.guildId !== this.guild.id || !input.sources.length || !input.destinationId || input.sources.some(source => source.id === input.destinationId)) {
       throw new UserError('Cần ít nhất một nguồn và một đích khác mọi nguồn, trong cùng server.');
     }
-    await requireMoveAdmin(this.guild, input.actorId);
-    const destination = await this.permissions(input.sources.map(source => source.id), input.destinationId);
+    const sourceIds = input.sources.map(source => source.id);
+    const recentPreflight = this.preflightKey === this.signatureFor(input.actorId, input.destinationId, sourceIds) &&
+      Date.now() - this.preflightAt < 2000;
+    this.preflightKey = null;
+    if (!recentPreflight) await requireMoveAdmin(this.guild, input.actorId);
+    const destination = await this.permissions(sourceIds, input.destinationId, !recentPreflight);
     if (destination.userLimit && this.occupancy(destination.id) + input.members.length > destination.userLimit) {
       throw new UserError('Channel đích không đủ chỗ cho toàn bộ snapshot. Hãy kiểm tra cấu hình /voice move-config và cài lại nguồn/đích.');
     }
@@ -78,6 +114,7 @@ export class DiscordMoveGateway implements MoveGateway {
 
   async snapshot(actorId: string, sourceIds: string[], destinationId: string): Promise<MoveSnapshot> {
     const sources = [...new Set(sourceIds)].map(id => ({ id, humans: 0, bots: 0 }));
+    const uniqueSourceIds = sources.map(source => source.id);
     const input: MoveInput = { id: '', actorId, guildId: this.guild.id, sources, destinationId,
       snapshotAt: null, botsSkipped: 0, members: [] };
     await this.validate(input);
@@ -91,14 +128,19 @@ export class DiscordMoveGateway implements MoveGateway {
     for (const occupant of occupants) {
       if (seen.has(occupant.userId)) continue;
       seen.add(occupant.userId);
-      const member = await this.guild.members.fetch({ user: occupant.userId, force: true });
+      const bot = await this.isBot(occupant.userId);
       const source = sources.find(source => source.id === occupant.sourceId)!;
-      if (member.user.bot) { source.bots++; input.botsSkipped++; }
+      if (bot) { source.bots++; input.botsSkipped++; }
       else { source.humans++; input.members.push(occupant); }
     }
-    await this.validate(input);
-    const destination = await this.voiceChannel(destinationId);
+    this.ensureReady();
+    const destination = await this.permissions(uniqueSourceIds, destinationId, false);
+    if (destination.userLimit && this.occupancy(destination.id) + input.members.length > destination.userLimit) {
+      throw new UserError('Channel đích không đủ chỗ cho toàn bộ snapshot. Hãy kiểm tra cấu hình /voice move-config và cài lại nguồn/đích.');
+    }
     if (Date.now() - takenAt >= 60000) throw new UserError('Quá trình xác minh kéo dài; snapshot đã cũ. Hãy kiểm tra cấu hình rồi chạy lại /voice move-all.');
+    this.preflightKey = this.signatureFor(actorId, destinationId, uniqueSourceIds);
+    this.preflightAt = Date.now();
     return { sources, destinationId, destinationLimit: destination.userLimit, destinationOccupancy: this.occupancy(destinationId),
       members: input.members, botsSkipped: input.botsSkipped, takenAt };
   }
@@ -106,11 +148,13 @@ export class DiscordMoveGateway implements MoveGateway {
   async scan(input: MoveInput, signal: AbortSignal): Promise<MoveScan> {
     this.ensureReady();
     try {
-      await requireMoveAdmin(this.guild, input.actorId);
-      await this.permissions(input.sources.map(source => source.id), input.destinationId!);
+      await requireMoveAdmin(this.guild, input.actorId, false);
+      await this.permissions(input.sources.map(source => source.id), input.destinationId!, false);
     } catch (error) {
       if (error instanceof RateLimitError) throw new MoveRetry(Math.max(error.retryAfter, error.timeToReset, error.sublimitTimeout, 1));
       if (error instanceof ChannelCheckError) throw new MoveInterrupted(error.reason);
+      if (error instanceof DiscordAPIError && Number(error.code) === 10003) throw new MoveInterrupted('channel_unavailable');
+      if (error instanceof DiscordAPIError && [50001, 50013].includes(Number(error.code))) throw new MoveInterrupted('missing_permissions');
       if (error instanceof UserError) throw new MoveInterrupted('missing_permissions');
       throw error;
     }
@@ -123,8 +167,7 @@ export class DiscordMoveGateway implements MoveGateway {
       signal.throwIfAborted();
       this.ensureReady();
       try {
-        const member = await this.guild.members.fetch({ user: userId, force: true });
-        if (member.user.bot) continue;
+        if (await this.isBot(userId)) continue;
         const voice = await this.rest.get(Routes.guildVoiceState(this.guild.id, userId), { signal }) as { channel_id: string | null };
         // An explicit read supersedes conservative capacity reservations from earlier requests.
         if (voice.channel_id === input.destinationId) this.arrivals.set(userId, input.destinationId!);
@@ -156,8 +199,8 @@ export class DiscordMoveGateway implements MoveGateway {
       return { status: 'unknown', reason: 'outcome_unknown' };
     };
     try {
-      const human = await this.guild.members.fetch({ user: member.userId, force: true });
-      if (human.user.bot) return { status: 'skipped', reason: 'bot_account' };
+      if (await this.isBot(member.userId)) return { status: 'skipped', reason: 'bot_account' };
+      const cachedBefore = this.guild.voiceStates.cache.get(member.userId)?.channelId;
       // Raw REST deliberately avoids VoiceStateManager.fetch(), which patches the
       // shared cache before VoiceStateUpdate can revoke a leader's relay capture.
       const voice = await this.rest.get(Routes.guildVoiceState(this.guild.id, member.userId), { signal }) as { channel_id: string | null };
@@ -167,13 +210,16 @@ export class DiscordMoveGateway implements MoveGateway {
       }
       this.arrivals.delete(member.userId);
       if (!voice.channel_id || !input.sources.some(source => source.id === voice.channel_id)) return { status: 'skipped', reason: 'left_sources' };
-      const destination = await this.permissions([voice.channel_id], input.destinationId!);
+      const destination = await this.permissions([voice.channel_id], input.destinationId!, false);
       if (destination.userLimit && this.occupancy(destination.id) >= destination.userLimit) return { status: 'failed', reason: 'destination_full' };
       this.ensureReady();
       signal.throwIfAborted();
-      // Do not overwrite a newer gateway departure received during permission checks.
-      const cached = this.guild.voiceStates.cache.get(member.userId);
-      if (!cached?.channelId || !input.sources.some(source => source.id === cached.channelId)) return { status: 'skipped', reason: 'left_sources' };
+      // Skip only when a newer gateway event arrived during checks moving the user out of sources;
+      // never let an unchanged/lagging gateway cache override the authoritative REST position read above.
+      const cachedNow = this.guild.voiceStates.cache.get(member.userId)?.channelId;
+      if (cachedNow !== cachedBefore && (!cachedNow || !input.sources.some(source => source.id === cachedNow))) {
+        return { status: 'skipped', reason: 'left_sources' };
+      }
       submitted = true;
       // Once sent, allow the current PATCH to finish within the transport's 5s
       // timeout on shutdown. The stop signal still prevents starting a new PATCH.
@@ -189,9 +235,11 @@ export class DiscordMoveGateway implements MoveGateway {
         retryAfterMs: Math.max(error.retryAfter, error.timeToReset, error.sublimitTimeout, 1) };
       if (error instanceof ChannelCheckError) return { status: 'failed', reason: error.reason };
       if (error instanceof DiscordAPIError) {
-        if ([10007, 10065, 40032].includes(Number(error.code))) return { status: 'skipped', reason: 'left_sources' };
+        const code = Number(error.code);
+        if ([10007, 10065, 40032].includes(code)) return { status: 'skipped', reason: 'left_sources' };
         if (error.status >= 500) return submitted ? unknown() : { status: 'failed', reason: 'discord_unavailable' };
-        return { status: 'failed', reason: [50001, 50013].includes(Number(error.code)) ? 'missing_permissions' : `discord_${error.code}` };
+        if (code === 10003) return { status: 'failed', reason: 'channel_unavailable' };
+        return { status: 'failed', reason: [50001, 50013].includes(code) ? 'missing_permissions' : `discord_${error.code}` };
       }
       if (error instanceof HTTPError && error.status >= 400 && error.status < 500) return { status: 'failed', reason: `discord_http_${error.status}` };
       // Never resend an ambiguous request. Its outcome must be checked by an admin.

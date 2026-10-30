@@ -27,5 +27,19 @@ export class RelayService {
     this.tail = operation.catch(() => {});
     return operation;
   }
+  setSession(running: boolean): Promise<void> {
+    if (!this.accepting) return Promise.reject(new Error('Service is stopping'));
+    const operation = this.tail.then(async () => {
+      const next = this.repository.setSession
+        ? await this.repository.setSession(running).catch(error => {
+          if (error instanceof CommitUncertainError) this.onUncertain(error);
+          throw error;
+        })
+        : { ...structuredClone(this.current), session: running };
+      this.publish(next);
+    });
+    this.tail = operation.catch(() => {});
+    return operation;
+  }
   async stop(): Promise<void> { this.accepting = false; await this.tail; }
 }

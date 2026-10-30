@@ -1,6 +1,6 @@
 import { generateDependencyReport } from '@discordjs/voice';
 import { escapeMarkdown } from 'discord.js';
-import { loadConfig } from './config.js';
+import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { LocalDatabase, LocalInstanceLease } from './sqlite.js';
 import { SqliteRelays } from './sqlite-relays.js';
@@ -63,7 +63,7 @@ async function main(): Promise<void> {
     (workerId, userId) => repository.identify(workerId, userId));
   const relays = new RelayService(repository, snapshot => runtime.apply(snapshot), fatal);
   commands = createCommandHandler({ config, relays,
-    setSession: running => runtime.setSession(running), leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
+    setSession: running => relays.setSession(running), leaders: team => runtime.workerStatus(team.workerId), onError: error => log.error({ err: error }, 'Command failed'),
     status: async groupId => {
       const snapshot = relays.snapshot;
       const lines = [`SQLite: ${await repository.healthy() ? 'OK' : 'Không kết nối được'}`, `Phiên: ${runtime.sessionRunning ? 'started' : 'stopped — dùng /start'}`];
@@ -98,13 +98,17 @@ async function main(): Promise<void> {
     if (stopping) return;
     await moveRepository.recover(config.guildId);
     await moveRepository.prune(config.guildId);
-    retentionTimer = setInterval(() => { void moveRepository.prune(config.guildId).catch(commandError); }, 86400000);
+    await repository.prune();
+    retentionTimer = setInterval(() => {
+      void moveRepository.prune(config.guildId).catch(commandError);
+      void repository.prune().catch(commandError);
+    }, 86400000);
     retentionTimer.unref();
     if (stopping) { clearInterval(retentionTimer); return; }
     await relays.initialize();
     if (stopping) return;
     runtime.start();
-    log.info('CrossTalk started; relay groups and bot connections are supervised independently');
+    log.info({ sessionRestored: runtime.sessionRunning }, 'CrossTalk started; relay groups and bot connections are supervised independently');
   } catch (error) {
     if (stopping) { await stopping; return; }
     log.fatal({ err: error }, 'Startup failed');
@@ -112,4 +116,8 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch(() => { console.error('CrossTalk could not start. Check required configuration and dependencies.'); process.exitCode = 1; });
+void main().catch(error => {
+  const detail = error instanceof ConfigError ? ` (${error.message})` : '';
+  console.error(`CrossTalk could not start${detail}. Check required configuration and dependencies.`);
+  process.exitCode = 1;
+});

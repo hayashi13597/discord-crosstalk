@@ -7,7 +7,7 @@ export interface RelayTeam {
   id: string; groupId: string; channelId: string;
   workerId: number;
 }
-export interface RelaySnapshot { groups: RelayGroup[]; teams: RelayTeam[] }
+export interface RelaySnapshot { groups: RelayGroup[]; teams: RelayTeam[]; session?: boolean }
 export type RelayMutation =
   | { kind: 'group.create'; name: string }
   | { kind: 'group.state'; groupId: string; state: 'active' | 'paused'; expected?: string }

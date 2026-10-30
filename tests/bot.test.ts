@@ -223,7 +223,10 @@ describe('Discord lifecycle', () => {
     const { bot, setRole, subscribe, subscriptions, guild } = setup();
     bot.start();
     await vi.advanceTimersByTimeAsync(1);
-    expect(bot.client.options).toMatchObject({ intents: expect.arrayContaining([GatewayIntentBits.GuildMembers]) });
+    expect(bot.client.options).toMatchObject({
+      intents: expect.arrayContaining([GatewayIntentBits.GuildMembers]),
+      makeCache: expect.any(Function),
+    });
     expect(bot.status()).toMatchObject({ leadersKnown: true, leaderIds: ['alice'] });
     setRole('bob', true);
     expect(bot.status().leaderIds).toEqual(['alice', 'bob']);

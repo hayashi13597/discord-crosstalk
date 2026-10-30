@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { AudioRouter, FrameQueue, FRAME_BYTES, mixFrames, type Output } from '../src/audio/router.js';
 import { createCodec } from '../src/audio/codec.js';
-import { LatestPacketStream } from '../src/audio/output.js';
+import { LatestPacketStream, VoiceOutput } from '../src/audio/output.js';
 const TEAMS = [1, 2, 3] as const;
 type Team = (typeof TEAMS)[number];
 
@@ -14,7 +14,7 @@ function setup(jitterMs = 0) {
   let now = 0;
   const channels = { 1: 'channel1', 2: 'channel2', 3: 'channel3' };
   const router = new AudioRouter(channels, { jitterMs, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, () => now);
-  const output = () => ({ write: vi.fn<(pcm: Buffer | undefined) => void>(), reset: vi.fn(), setReady: vi.fn<(ready: boolean) => void>(), close: vi.fn() } satisfies Output);
+  const output = () => ({ write: vi.fn<Output['write']>(), reset: vi.fn(), setReady: vi.fn<(ready: boolean) => void>(), close: vi.fn() } satisfies Output);
   const outputs = Object.fromEntries(TEAMS.map(team => [team, output()])) as Record<Team, ReturnType<typeof output>>;
   for (const team of TEAMS) { router.attach(team, outputs[team]); router.setTransport(team, true); }
   router.setLeaders({ 1: ['alice'], 2: ['bob'], 3: ['carol'] });
@@ -49,6 +49,57 @@ describe('leader-only routing', () => {
     expect(outputs[1].write.mock.calls[0]![0]!.readInt16LE()).toBe(2500);
     expect(outputs[2].write.mock.calls[0]![0]!.readInt16LE()).toBe(2000);
     expect(outputs[3].write.mock.calls[0]![0]!.readInt16LE()).toBe(1500);
+  });
+  it('shares a single PCM mix across non-speaking listener teams while keeping per-output Opus encoder state continuous', () => {
+    const { router, outputs } = setup();
+    router.setTeamLeaders(1, ['alice', 'dave']);
+    const alice = router.beginSource(1, 'alice', 'channel1', false)!;
+    const dave = router.beginSource(1, 'dave', 'channel1', false)!;
+    router.push(1, alice, pcm(1000));
+    router.push(1, dave, pcm(3000));
+    router.tick();
+    const mixed2 = outputs[2].write.mock.calls[0]![0];
+    const mixed3 = outputs[3].write.mock.calls[0]![0];
+    expect(mixed2).toBeDefined();
+    expect(mixed2).toBe(mixed3);
+    expect(mixed2!.readInt16LE()).toBe(2000);
+
+    // Verify Team 3's Opus stream stays continuous with its own encoder even when Team 2 speaks intermittently.
+    const liveRouter = new AudioRouter({ 1: 'c1', 2: 'c2', 3: 'c3' }, { jitterMs: 0, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, () => 0);
+    const out2 = new VoiceOutput(vi.fn());
+    const out3 = new VoiceOutput(vi.fn());
+    let stream3: { read(): unknown } | undefined;
+    vi.spyOn(out3.player, 'play').mockImplementation(resource => {
+      stream3 = resource.playStream;
+    });
+    liveRouter.attach(2, out2); liveRouter.attach(3, out3);
+    liveRouter.setTransport(1, true); liveRouter.setTransport(2, true); liveRouter.setTransport(3, true);
+    liveRouter.setLeaders({ 1: ['alice'], 2: ['bob'], 3: ['carol'] });
+    const e1 = liveRouter.beginSource(1, 'alice', 'c1', false)!;
+    const e2 = liveRouter.beginSource(2, 'bob', 'c2', false)!;
+    const refEncoder = createCodec();
+    const refDecoder = createCodec();
+    const out3Decoder = createCodec();
+    try {
+      for (let f = 0; f < 30; f++) {
+        const frame = Buffer.alloc(FRAME_BYTES);
+        for (let i = 0; i < 960; i++) {
+          const sample = Math.round(16000 * Math.sin((2 * Math.PI * 440 * (f * 960 + i)) / 48000));
+          frame.writeInt16LE(sample, i * 4);
+          frame.writeInt16LE(sample, i * 4 + 2);
+        }
+        liveRouter.push(1, e1, frame);
+        if (f === 20) liveRouter.push(2, e2, pcm(0));
+        liveRouter.tick();
+        const expectedPcm = f === 20 ? mixFrames([frame, pcm(0)], 1, 0.5)! : frame;
+        const refOut = refDecoder.decode(refEncoder.encode(expectedPcm));
+        const actualOut = out3Decoder.decode(stream3!.read() as Buffer);
+        expect(actualOut.equals(refOut)).toBe(true);
+      }
+    } finally {
+      out2.close(); out3.close();
+      refEncoder.close(); refDecoder.close(); out3Decoder.close();
+    }
   });
   it('revokes buffered audio and late callbacks immediately on replacement/removal', () => {
     const { router, outputs, epoch } = setup();
@@ -137,6 +188,32 @@ describe('leader-only routing', () => {
     expect(vi.getTimerCount()).toBe(0);
     for (const team of TEAMS) expect(outputs[team].close).toHaveBeenCalledOnce();
   });
+  it('compensates timer drift, catches up delayed frames, and does not drift fast on early wakeups', () => {
+    vi.useFakeTimers();
+    const { router, outputs, epoch, advance } = setup();
+    const source = epoch(1);
+    router.push(1, source, pcm(100));
+    router.push(1, source, pcm(200));
+    router.push(1, source, pcm(300));
+    router.start();
+    // Simulate setTimeout firing 22ms late (42ms elapsed instead of 20ms).
+    advance(42);
+    vi.advanceTimersByTime(20);
+    expect(outputs[2].write).toHaveBeenCalledTimes(2);
+    expect(outputs[2].write.mock.calls[0]![0]!.readInt16LE()).toBe(100);
+    expect(outputs[2].write.mock.calls[1]![0]!.readInt16LE()).toBe(200);
+
+    // Next tick is scheduled for t=60 (18ms remaining). Simulate sub-ms early wakeup at t=59.4.
+    advance(17.4);
+    vi.advanceTimersByTime(18);
+    expect(outputs[2].write).toHaveBeenCalledTimes(2);
+    // Remaining 0.6ms completes t=60.0 and emits the 3rd frame right on phase.
+    advance(0.6);
+    vi.advanceTimersByTime(1);
+    expect(outputs[2].write).toHaveBeenCalledTimes(3);
+    expect(outputs[2].write.mock.calls[2]![0]!.readInt16LE()).toBe(300);
+    router.stop();
+  });
   it('splits decoded PCM into 20ms frames without repeating old samples', () => {
     const { router, outputs, epoch } = setup();
     const version = epoch(1);
@@ -168,18 +245,54 @@ describe('bounded jitter queue and mixing', () => {
     expect(queue.size).toBe(10);
     expect(queue.take(0)?.readInt16LE()).toBe(90);
   });
-  it('limits positive and negative peaks; silence does not reuse audio', () => {
+  it('limits positive and negative peaks, bypasses single-source unity gain, and handles unaligned buffers', () => {
+    const single = pcm(1234);
+    expect(mixFrames([single], 1, 0.5)).toBe(single);
     expect(mixFrames([pcm(32767), pcm(32767)], 1, 0.5)?.readInt16LE()).toBe(32767);
     expect(mixFrames([pcm(-32768), pcm(-32768)], 1, 1)?.readInt16LE()).toBe(-32768);
     expect(mixFrames([pcm(32767)], 2, 1)?.readInt16LE()).toBe(32767);
+    const raw = Buffer.alloc(FRAME_BYTES + 1);
+    pcm(1000).copy(raw, 1);
+    const unaligned = raw.subarray(1, 1 + FRAME_BYTES);
+    expect(mixFrames([unaligned, pcm(1000)], 1, 0.5)?.readInt16LE()).toBe(1000);
     expect(mixFrames([], 1, 0.5)).toBeUndefined();
   });
-  it('bounds output buffering to the latest Opus packet', () => {
+  it('bounds output buffering to 3 Opus packets (60ms) in FIFO order and supports clean EOF', () => {
     const stream = new LatestPacketStream();
     for (let i = 0; i < 100; i++) stream.offer(Buffer.from([i]));
-    expect(stream.readableLength).toBe(1);
+    expect(stream.readableLength).toBe(3);
+    expect(stream.read()).toEqual(Buffer.from([97]));
+    expect(stream.read()).toEqual(Buffer.from([98]));
+    stream.finish();
+    expect(stream.finishedOffering).toBe(true);
+    stream.offer(Buffer.from([100]));
     expect(stream.read()).toEqual(Buffer.from([99]));
+    expect(stream.read()).toBeNull();
     stream.destroy();
+  });
+  it('stays idle in silence and stops offering after 5 trailing OPUS_SILENCE frames', () => {
+    const onError = vi.fn();
+    const out = new VoiceOutput(onError);
+    const playSpy = vi.spyOn(out.player, 'play');
+    out.setReady(true);
+    for (let i = 0; i < 10; i++) out.write(undefined);
+    expect(playSpy).not.toHaveBeenCalled();
+
+    out.write(pcm(800));
+    expect(playSpy).toHaveBeenCalledOnce();
+    // Brief 2-frame pause followed by speech keeps the same resource open without re-playing.
+    out.write(undefined);
+    out.write(undefined);
+    out.write(pcm(900));
+    expect(playSpy).toHaveBeenCalledOnce();
+
+    // 5 silence frames close out the burst; subsequent silence ticks stay idle until new speech.
+    for (let i = 0; i < 10; i++) out.write(undefined);
+    expect(playSpy).toHaveBeenCalledOnce();
+    out.write(pcm(1000));
+    expect(playSpy).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
+    out.close();
   });
   it('encodes and decodes a real Opus frame using the installed codec', () => {
     const encoder = createCodec();

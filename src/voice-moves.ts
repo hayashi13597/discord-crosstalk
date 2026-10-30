@@ -13,6 +13,12 @@ const MAX_ATTEMPTS = 3;
 const JOB_MS = 120000;
 const fatalReasons = new Set(['destination_full', 'missing_permissions', 'channel_unavailable']);
 const retryReasons = new Set(['rate_limited', 'discord_unavailable', 'voice_state_unverified', 'outcome_unknown']);
+// Ephemeral progress replies dismissed by the caller (10008) or expired interaction tokens (10062, 50027)
+// must not abort moving remaining members; durable results remain inspectable via /voice move-status.
+function isDismissedProgressError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && [10008, 10062, 50027].includes(Number(error.code)));
+}
+
 export interface MemberOutcome {
   status: 'moved' | 'skipped' | 'failed' | 'unknown';
   reason: string | null;
@@ -48,13 +54,22 @@ export class VoiceMoveService {
     if (input.snapshotAt === null || Date.now() >= confirmBy) throw new UserError('Snapshot đã hết hạn. Hãy chạy lại /voice move-all.');
     await this.repository.create(input);
     let lastProgress = 0;
+    let progressDismissed = false;
     const progress = async (force = false) => {
+      if (progressDismissed) return;
       if (!force && Date.now() - lastProgress < 5000) return;
       lastProgress = Date.now();
       const job = await this.repository.get(input.id, input.guildId);
       if (!job) throw new Error('Voice move audit not found');
       try { await notify(job); }
-      catch (error) { this.onError(error); throw new MoveInterrupted('progress_delivery_failed'); }
+      catch (error) {
+        this.onError(error);
+        if (isDismissedProgressError(error)) {
+          progressDismissed = true;
+          return;
+        }
+        throw new MoveInterrupted('progress_delivery_failed');
+      }
     };
     const deadline = Date.now() + JOB_MS;
     const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(JOB_MS)]);
@@ -122,10 +137,12 @@ export class VoiceMoveService {
           let outcome: MemberOutcome;
           do {
             check();
-            await this.repository.enqueue(input.id, [member]);
+            const currentAttempts = attempts.get(member.userId) ?? 0;
+            // Initial Round 0 members are already persisted as 'pending' by repository.create().
+            if (round > 0 || currentAttempts > 0) await this.repository.enqueue(input.id, [member]);
             await this.repository.processing(input.id, member.userId);
             check();
-            attempts.set(member.userId, (attempts.get(member.userId) ?? 0) + 1);
+            attempts.set(member.userId, currentAttempts + 1);
             outcome = await gateway.move(member, input, signal);
             await this.repository.outcome(input.id, member.userId, outcome.status, outcome.reason);
             if (fatalReasons.has(outcome.reason ?? '')) throw new MoveInterrupted(outcome.reason!);
