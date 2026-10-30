@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChannelType, DiscordAPIError, PermissionFlagsBits, RateLimitError } from 'discord.js';
 import { createMoveRest, DiscordMoveGateway, requireMoveAdmin } from '../src/voice-move-discord.js';
-import { discordHarness, moveInput } from './voice-move-helpers.js';
+import { VoiceMoveService } from '../src/voice-moves.js';
+import { discordHarness, MemoryMoves, moveInput } from './voice-move-helpers.js';
+
+afterEach(() => vi.useRealTimers());
 
 describe('Discord mass move eligibility', () => {
   it('snapshots all selected sources, excludes every bot, and includes leaders regardless of group', async () => {
@@ -127,6 +130,48 @@ describe('Discord mass move eligibility', () => {
     expect(await gateway.move({ userId: 'human', sourceId: 'a' }, input, signal)).toEqual({ status: 'moved', reason: null });
     expect(state.rawGuild.channels.fetch).toHaveBeenCalledExactlyOnceWith('a', { force: true });
     expect(channelA.permissionsFor).toHaveBeenCalled();
+  });
+  it('rejects before moving anyone when caller permissions are revoked during occupant verification or after preflight expires', async () => {
+    vi.useFakeTimers();
+    const state = discordHarness();
+    const originalMembersFetch = state.rawGuild.members.fetch.getMockImplementation()!;
+    const originalChannelsFetch = state.rawGuild.channels.fetch.getMockImplementation()!;
+
+    // Fast occupant verification (< 2s): caller loses MoveMembers mid-snapshot.
+    state.rawGuild.members.fetch.mockImplementation(async options => {
+      if (options.user === 'human') state.permissions.delete(PermissionFlagsBits.MoveMembers);
+      return originalMembersFetch(options);
+    });
+    const gateway = new DiscordMoveGateway(state.guild, state.rest);
+    const service = new VoiceMoveService(new MemoryMoves(), vi.fn());
+    await expect(gateway.snapshot('admin', ['a', 'b'], 'd')).rejects.toThrow('Move Members');
+    await expect(service.run(moveInput(), gateway, vi.fn())).rejects.toThrow('Move Members');
+    expect(state.patch).not.toHaveBeenCalled();
+
+    // Slow occupant verification (>= 2s) + slow channel recheck: preflight age tracks actual caller check,
+    // so validate() re-checks caller permissions before moving the first member.
+    state.permissions.add(PermissionFlagsBits.MoveMembers);
+    const slowGateway = new DiscordMoveGateway(state.guild, state.rest);
+    let refreshedAfterOccupants = false;
+    state.rawGuild.members.fetch.mockImplementation(async options => {
+      if (options.user === 'human') {
+        vi.advanceTimersByTime(3000);
+        refreshedAfterOccupants = true;
+      }
+      return originalMembersFetch(options);
+    });
+    state.rawGuild.channels.fetch.mockImplementation(async id => {
+      if (refreshedAfterOccupants && id === 'd') {
+        vi.advanceTimersByTime(2500);
+        state.permissions.delete(PermissionFlagsBits.ManageGuild);
+      }
+      return originalChannelsFetch(id);
+    });
+    const snapshot = await slowGateway.snapshot('admin', ['a', 'b'], 'd');
+    const input = { ...moveInput(0), sources: snapshot.sources, destinationId: snapshot.destinationId,
+      members: snapshot.members, snapshotAt: snapshot.takenAt };
+    await expect(service.run(input, slowGateway, vi.fn())).rejects.toThrow('Move Members');
+    expect(state.patch).not.toHaveBeenCalled();
   });
   it('does not move bots, and never mutates the voice cache used by relay leaders', async () => {
     const state = discordHarness();

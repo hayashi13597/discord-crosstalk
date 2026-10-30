@@ -188,7 +188,7 @@ describe('leader-only routing', () => {
     expect(vi.getTimerCount()).toBe(0);
     for (const team of TEAMS) expect(outputs[team].close).toHaveBeenCalledOnce();
   });
-  it('compensates timer drift, catches up delayed frames, and does not drift fast on early wakeups', () => {
+  it('compensates sub-frame timer drift, bounds multi-frame catch-up, and does not drift fast on early wakeups', () => {
     vi.useFakeTimers();
     const { router, outputs, epoch, advance } = setup();
     const source = epoch(1);
@@ -196,23 +196,121 @@ describe('leader-only routing', () => {
     router.push(1, source, pcm(200));
     router.push(1, source, pcm(300));
     router.start();
-    // Simulate setTimeout firing 22ms late (42ms elapsed instead of 20ms).
-    advance(42);
+    // Simulate setTimeout firing 8ms late (28ms elapsed instead of 20ms).
+    advance(28);
     vi.advanceTimersByTime(20);
-    expect(outputs[2].write).toHaveBeenCalledTimes(2);
+    expect(outputs[2].write).toHaveBeenCalledTimes(1);
     expect(outputs[2].write.mock.calls[0]![0]!.readInt16LE()).toBe(100);
-    expect(outputs[2].write.mock.calls[1]![0]!.readInt16LE()).toBe(200);
 
-    // Next tick is scheduled for t=60 (18ms remaining). Simulate sub-ms early wakeup at t=59.4.
-    advance(17.4);
-    vi.advanceTimersByTime(18);
-    expect(outputs[2].write).toHaveBeenCalledTimes(2);
-    // Remaining 0.6ms completes t=60.0 and emits the 3rd frame right on phase.
+    // Next tick is scheduled for t=40 (12ms remaining). Simulate sub-ms early wakeup at t=39.4.
+    advance(11.4);
+    vi.advanceTimersByTime(12);
+    expect(outputs[2].write).toHaveBeenCalledTimes(1);
+    // Remaining 0.6ms completes t=40.0 and emits the 2nd frame right on phase.
     advance(0.6);
     vi.advanceTimersByTime(1);
+    expect(outputs[2].write).toHaveBeenCalledTimes(2);
+    expect(outputs[2].write.mock.calls[1]![0]!.readInt16LE()).toBe(200);
+
+    // Simulate a multi-frame stall (45ms elapsed to t=85): emits only 1 frame and keeps a 20ms cadence.
+    advance(45);
+    vi.advanceTimersByTime(20);
     expect(outputs[2].write).toHaveBeenCalledTimes(3);
     expect(outputs[2].write.mock.calls[2]![0]!.readInt16LE()).toBe(300);
+    advance(19);
+    vi.advanceTimersByTime(19);
+    expect(outputs[2].write).toHaveBeenCalledTimes(3);
+    advance(1);
+    vi.advanceTimersByTime(1);
+    expect(outputs[2].write).toHaveBeenCalledTimes(4);
     router.stop();
+  });
+  it('preserves queued voice packets in VoiceOutput when a delayed timer fires at 180ms before AudioPlayer reads', () => {
+    vi.useFakeTimers();
+    const opusSilence = Buffer.from([0xf8, 0xff, 0xfe]);
+    let now = 0;
+    const router = new AudioRouter({ 1: 'c1', 2: 'c2' }, { jitterMs: 0, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, () => now);
+    const out2 = new VoiceOutput(vi.fn());
+    let stream2: LatestPacketStream | undefined;
+    vi.spyOn(out2.player, 'play').mockImplementation(resource => {
+      stream2 = resource.playStream as LatestPacketStream;
+    });
+    router.attach(2, out2);
+    router.setTransport(1, true);
+    router.setTransport(2, true);
+    router.setLeaders({ 1: ['alice'], 2: ['bob'] });
+    const source = router.beginSource(1, 'alice', 'c1', false)!;
+    const decoder = createCodec();
+    const toneFrame = (frameIndex: number, amplitude: number) => {
+      const frame = Buffer.alloc(FRAME_BYTES);
+      for (let i = 0; i < 960; i++) {
+        const sample = Math.round(amplitude * Math.sin((2 * Math.PI * 440 * (frameIndex * 960 + i)) / 48000));
+        frame.writeInt16LE(sample, i * 4);
+        frame.writeInt16LE(sample, i * 4 + 2);
+      }
+      return frame;
+    };
+    const peak = (buf: Buffer) => {
+      let max = 0;
+      for (let i = 0; i < buf.length; i += 2) max = Math.max(max, Math.abs(buf.readInt16LE(i)));
+      return max;
+    };
+    try {
+      router.start();
+      // 6 voice frames arrive across 0..100ms while the router timer is delayed until 180ms (< maxQueueMs = 200ms).
+      for (let i = 0; i < 6; i++) {
+        now = i * 20;
+        router.push(1, source, toneFrame(i, (i + 1) * 3000));
+      }
+      now = 180;
+      vi.advanceTimersByTime(20);
+
+      // Before AudioPlayer reads anything at 180ms, only 1 voice packet was offered (not 6 voice + 3 silence).
+      expect(stream2).toBeDefined();
+      expect(stream2!.readableLength).toBe(1);
+      const peaks: number[] = [];
+      const firstPacket = stream2!.read() as Buffer;
+      expect(firstPacket.equals(opusSilence)).toBe(false);
+      peaks.push(peak(decoder.decode(firstPacket)));
+
+      // Subsequent frames drain at a steady 20ms cadence as AudioPlayer consumes one packet per 20ms tick.
+      for (let step = 1; step < 6; step++) {
+        now += 20;
+        vi.advanceTimersByTime(20);
+        expect(stream2!.readableLength).toBe(1);
+        const packet = stream2!.read() as Buffer;
+        expect(packet.equals(opusSilence)).toBe(false);
+        peaks.push(peak(decoder.decode(packet)));
+      }
+      expect(peaks).toHaveLength(6);
+      for (let i = 1; i < peaks.length; i++) expect(peaks[i]!).toBeGreaterThan(peaks[i - 1]!);
+
+      // Trailing silence frames follow only after all 6 voice frames have been consumed.
+      now += 20;
+      vi.advanceTimersByTime(20);
+      expect((stream2!.read() as Buffer).equals(opusSilence)).toBe(true);
+      for (let i = 0; i < 4; i++) {
+        now += 20;
+        vi.advanceTimersByTime(20);
+        stream2!.read();
+      }
+
+      // Even when 6 frames are queued together before a 180ms timer stall and AudioPlayer has not read yet,
+      // the output queue holds voice packets instead of being overwritten by trailing silence.
+      const burstStart = now;
+      for (let i = 0; i < 6; i++) router.push(1, source, toneFrame(i + 10, (i + 1) * 3000));
+      now = burstStart + 180;
+      vi.advanceTimersByTime(20);
+      expect(stream2!.readableLength).toBe(1);
+      now = burstStart + 200;
+      vi.advanceTimersByTime(20);
+      expect(stream2!.readableLength).toBe(2);
+      expect((stream2!.read() as Buffer).equals(opusSilence)).toBe(false);
+      expect((stream2!.read() as Buffer).equals(opusSilence)).toBe(false);
+    } finally {
+      router.stop();
+      decoder.close();
+    }
   });
   it('splits decoded PCM into 20ms frames without repeating old samples', () => {
     const { router, outputs, epoch } = setup();

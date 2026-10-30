@@ -209,14 +209,12 @@ export class AudioRouter<T extends string | number = number> {
       if (!this.running) return;
       try {
         const now = this.clock();
-        if (now - nextAt > this.settings.maxQueueMs) {
+        if (now >= nextAt) {
           this.tick();
-          nextAt = this.clock() + FRAME_MS;
-        } else {
-          while (this.running && this.clock() >= nextAt) {
-            this.tick();
-            nextAt += FRAME_MS;
-          }
+          const current = this.clock();
+          // Cap catch-up to one frame per wakeup and keep a 20ms cadence after multi-frame stalls
+          // so VoiceOutput's bounded 3-packet stream is never overwritten before AudioPlayer reads.
+          nextAt = current - nextAt >= FRAME_MS ? current + FRAME_MS : nextAt + FRAME_MS;
         }
       } catch (error) {
         try { this.stop(); } finally { this.onFault?.(error); }

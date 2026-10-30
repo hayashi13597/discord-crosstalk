@@ -117,6 +117,7 @@ export class DiscordMoveGateway implements MoveGateway {
     const uniqueSourceIds = sources.map(source => source.id);
     const input: MoveInput = { id: '', actorId, guildId: this.guild.id, sources, destinationId,
       snapshotAt: null, botsSkipped: 0, members: [] };
+    let preflightCheckedAt = Date.now();
     await this.validate(input);
     const takenAt = Date.now();
     // Copy IDs and channels together before awaiting: arrivals during member verification
@@ -134,13 +135,17 @@ export class DiscordMoveGateway implements MoveGateway {
       else { source.humans++; input.members.push(occupant); }
     }
     this.ensureReady();
-    const destination = await this.permissions(uniqueSourceIds, destinationId, false);
+    const recheckStartedAt = Date.now();
+    const refreshPermissions = recheckStartedAt - preflightCheckedAt >= 2000;
+    await requireMoveAdmin(this.guild, actorId);
+    const destination = await this.permissions(uniqueSourceIds, destinationId, refreshPermissions);
+    if (refreshPermissions) preflightCheckedAt = recheckStartedAt;
     if (destination.userLimit && this.occupancy(destination.id) + input.members.length > destination.userLimit) {
       throw new UserError('Channel đích không đủ chỗ cho toàn bộ snapshot. Hãy kiểm tra cấu hình /voice move-config và cài lại nguồn/đích.');
     }
     if (Date.now() - takenAt >= 60000) throw new UserError('Quá trình xác minh kéo dài; snapshot đã cũ. Hãy kiểm tra cấu hình rồi chạy lại /voice move-all.');
     this.preflightKey = this.signatureFor(actorId, destinationId, uniqueSourceIds);
-    this.preflightAt = Date.now();
+    this.preflightAt = preflightCheckedAt;
     return { sources, destinationId, destinationLimit: destination.userLimit, destinationOccupancy: this.occupancy(destinationId),
       members: input.members, botsSkipped: input.botsSkipped, takenAt };
   }
