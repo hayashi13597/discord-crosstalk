@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, ChannelType, Options, PermissionFlagsBits, RESTEvents, Status, type Interaction } from 'discord.js';
+import { Client, Events, GatewayIntentBits, ChannelType, Options, PermissionFlagsBits, RateLimitError, RESTEvents, Status, type Interaction } from 'discord.js';
 import { entersState, EndBehaviorType, joinVoiceChannel, VoiceConnectionStatus,
   type AudioReceiveStream, type VoiceConnection } from '@discordjs/voice';
 import type { Logger } from 'pino';
@@ -8,6 +8,7 @@ import { AudioRouter } from './audio/router.js';
 import { VoiceOutput } from './audio/output.js';
 import { registerCommands } from './commands.js';
 import { safeError } from './logger.js';
+import { gatewayRestOptions } from './gateway-rest.js';
 import type { LeaderPresence } from './types.js';
 
 export interface BotStatus<T = number> extends LeaderPresence {
@@ -94,6 +95,7 @@ export class TeamBot<T extends string | number = number> {
   private gatewayReconnecting = false;
   private gatewayAbort?: AbortController;
   private gatewayFailure?: Error;
+  private gatewayRetryAt = 0;
 
   private revision = 0;
   private identified = false;
@@ -127,12 +129,12 @@ export class TeamBot<T extends string | number = number> {
   }
 
   private createClient(): Client {
+    const active = () => this.currentClient === client && !this.stopped;
     const client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
       makeCache: workerCacheFactory,
-      rest: { timeout: 15000 },
+      rest: gatewayRestOptions(this.log, this.workerId, active),
     });
-    const active = () => this.currentClient === client && !this.stopped;
     const error = (error: Error) => { if (active()) this.recordError(error); };
     const disconnected = () => {
       if (!active()) return;
@@ -151,6 +153,8 @@ export class TeamBot<T extends string | number = number> {
       this.schedule(0);
     };
     client.on(Events.Debug, message => {
+      // discord.js masks only the signature, leaving the token prefix visible.
+      if (message.startsWith('Provided token:')) return;
       if (active()) this.log.debug({ worker: this.workerId, detail: message }, 'Discord gateway debug');
     });
     client.rest.on(RESTEvents.RateLimited, data => {
@@ -217,7 +221,7 @@ export class TeamBot<T extends string | number = number> {
     if (this.stopped) return;
     if (this.running) { this.requested = true; return; }
     clearTimeout(this.timer);
-    this.timer = setTimeout(() => { void this.check(); }, ms);
+    this.timer = setTimeout(() => { void this.check(); }, Math.max(ms, this.gatewayRetryAt - Date.now()));
   }
 
   private async check(): Promise<void> {
@@ -282,6 +286,7 @@ export class TeamBot<T extends string | number = number> {
         return Object.assign(new Error(`Discord gateway timed out after 30000ms during ${phase} (status: ${status})`),
           { code: 'DISCORD_GATEWAY_TIMEOUT' });
       });
+      this.gatewayRetryAt = 0;
       this.log.info({ worker: this.workerId }, 'Discord gateway ready');
     } finally {
       client.off(Events.ClientReady, checkReady);
@@ -302,7 +307,16 @@ export class TeamBot<T extends string | number = number> {
       this.destroyConnection();
       try { await this.connectGateway(); }
       catch (error) {
-        if (stale()) return;
+        if (this.stopped) return;
+        if (error instanceof RateLimitError && error.route === '/gateway/bot') {
+          // A new Client has an empty rate-limit queue. Preserve Discord's wait
+          // even when configure()/gateway events request an immediate retry.
+          const waits = [error.retryAfter, error.timeToReset, error.sublimitTimeout].filter(Number.isFinite);
+          const retryAfterMs = Math.max(30000, ...waits);
+          this.gatewayRetryAt = Date.now() + retryAfterMs;
+          Object.assign(error, { code: 'DISCORD_GATEWAY_RATE_LIMITED' });
+          this.log.warn({ worker: this.workerId, retryAfterMs }, 'Discord gateway rate limited; delaying next login');
+        }
         // destroy() is terminal in discord.js: retries must use a fresh Client.
         const previous = this.client;
         this.currentClient = this.createClient();
@@ -311,6 +325,9 @@ export class TeamBot<T extends string | number = number> {
         this.identified = false;
         this.gatewayReconnecting = false;
         await previous.destroy();
+        // Configuration may change while login is pending. It must not discard
+        // the cooldown or leave a terminally destroyed client for the next check.
+        if (stale()) return;
         throw error;
       }
     }

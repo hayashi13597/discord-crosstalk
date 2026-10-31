@@ -5,7 +5,7 @@ import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
 import { loadConfig } from '../src/config.js';
 import { TeamBot, type WorkerOptions } from '../src/bot.js';
 import { registerCommands } from '../src/commands.js';
-import { Events, GatewayIntentBits, RESTEvents, type Client, type Interaction } from 'discord.js';
+import { Events, GatewayIntentBits, RateLimitError, RESTEvents, type Client, type Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 
 const mocks = vi.hoisted(() => ({ join: vi.fn(), enter: vi.fn(), codecClosed: vi.fn() }));
@@ -241,6 +241,37 @@ describe('Discord lifecycle', () => {
     expect(log.warn).toHaveBeenCalledExactlyOnceWith({
       worker: 1, global: true, scope: 'global', retryAfterMs: 60000,
     }, 'Discord REST rate limited; waiting before retry');
+  });
+  it('keeps the gateway cooldown when configuration changes during login and after client replacement', async () => {
+    const { bot, router, configureClient } = setup();
+    const previous = bot.client;
+    let fail!: (error: Error) => void;
+    vi.spyOn(previous, 'login').mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    bot.configure(1, router, channels[1], true);
+    fail(new RateLimitError({
+      global: false, scope: 'user', retryAfter: 120000, timeToReset: 0, sublimitTimeout: 120000,
+      method: 'GET', route: '/gateway/bot', url: 'https://discord.com/api/v10/gateway/bot',
+      hash: 'test', limit: 1, majorParameter: 'global',
+    }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(previous.destroy).toHaveBeenCalledOnce();
+    const replacement = bot.client;
+    configureClient();
+    bot.configure(1, router, channels[1], true);
+    await vi.advanceTimersByTimeAsync(119998);
+    expect(replacement.login).not.toHaveBeenCalled();
+    expect(mocks.join).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2);
+    expect(replacement.login).toHaveBeenCalledOnce();
+    expect(bot.status().receiving).toBe(true);
+  });
+  it('omits the partially masked token from dependency debug messages', () => {
+    const { bot, log } = setup();
+    bot.client.emit(Events.Debug, 'Provided token: private-prefix.********');
+    bot.client.emit(Events.Debug, 'Preparing to connect to the gateway...');
+    expect(log.debug).toHaveBeenCalledExactlyOnceWith({ worker: 1, detail: 'Preparing to connect to the gateway...' }, 'Discord gateway debug');
   });
   it('cancels gateway readiness waits on shutdown without scheduling a retry', async () => {
     const { bot } = setup();
