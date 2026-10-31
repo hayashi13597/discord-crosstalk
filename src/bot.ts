@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits, ChannelType, Options, PermissionFlagsBits, type Interaction } from 'discord.js';
+import { Client, Events, GatewayIntentBits, ChannelType, Options, PermissionFlagsBits, RESTEvents, Status, type Interaction } from 'discord.js';
 import { entersState, EndBehaviorType, joinVoiceChannel, VoiceConnectionStatus,
   type AudioReceiveStream, type VoiceConnection } from '@discordjs/voice';
 import type { Logger } from 'pino';
@@ -25,13 +25,21 @@ export function retryDelay(attempt: number, random = Math.random): number {
   return Math.round(Math.min(30000, 1000 * 2 ** Math.min(attempt, 5)) * (0.8 + 0.2 * random()));
 }
 
-async function deadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+async function deadline<T>(promise: Promise<T>, ms: number, timeoutError: () => Error): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timeout = setTimeout(() => reject(new Error('Discord operation timed out')), ms);
+      timeout = setTimeout(() => reject(timeoutError()), ms);
     })]);
   } finally { clearTimeout(timeout); }
+}
+
+function gatewayCloseError(code: number): Error {
+  const message = code === 4004 ? 'Discord authentication failed; check this worker\'s BOT_TOKEN'
+    : code === 4014 ? 'Discord rejected privileged intents; enable Server Members Intent for this bot in the Developer Portal'
+    : code === 4013 ? 'Discord rejected invalid gateway intents'
+    : `Discord gateway disconnected with close code ${code}`;
+  return Object.assign(new Error(message), { code: `DISCORD_GATEWAY_CLOSED_${code}` });
 }
 
 export interface WorkerOptions {
@@ -85,6 +93,7 @@ export class TeamBot<T extends string | number = number> {
   private gatewayStarted = false;
   private gatewayReconnecting = false;
   private gatewayAbort?: AbortController;
+  private gatewayFailure?: Error;
 
   private revision = 0;
   private identified = false;
@@ -141,9 +150,22 @@ export class TeamBot<T extends string | number = number> {
       this.disable();
       this.schedule(0);
     };
+    client.on(Events.Debug, message => {
+      if (active()) this.log.debug({ worker: this.workerId, detail: message }, 'Discord gateway debug');
+    });
+    client.rest.on(RESTEvents.RateLimited, data => {
+      if (active()) this.log.warn({ worker: this.workerId, global: data.global,
+        scope: data.scope, retryAfterMs: data.retryAfter }, 'Discord REST rate limited; waiting before retry');
+    });
     client.on(Events.Error, error);
     client.on(Events.ShardError, error);
-    client.on(Events.ShardDisconnect, disconnected);
+    client.on(Events.ShardDisconnect, (event, shardId) => {
+      if (!active()) return;
+      // discord.js emits shardDisconnect only for an unrecoverable close.
+      this.gatewayFailure = gatewayCloseError(event.code);
+      this.log.warn({ worker: this.workerId, shardId, closeCode: event.code }, 'Discord gateway disconnected');
+      disconnected();
+    });
     client.on(Events.ShardReconnecting, disconnected);
     client.on(Events.ClientReady, ready);
     client.on(Events.ShardReady, ready);
@@ -226,17 +248,23 @@ export class TeamBot<T extends string | number = number> {
 
   private async connectGateway(): Promise<void> {
     const client = this.client;
+    if (this.gatewayFailure) throw this.gatewayFailure;
+    let phase = this.gatewayStarted ? 'resume' : 'login';
     const abort = new AbortController();
     this.gatewayAbort = abort;
     let checkReady!: () => void;
+    let disconnected!: () => void;
     const ready = new Promise<void>((resolve, reject) => {
       checkReady = () => { if (this.gatewayReady()) resolve(); };
+      disconnected = () => { if (this.gatewayFailure) reject(this.gatewayFailure); };
       client.on(Events.ClientReady, checkReady);
       client.on(Events.ShardReady, checkReady);
       client.on(Events.ShardResume, checkReady);
+      client.on(Events.ShardDisconnect, disconnected);
       abort.signal.addEventListener('abort', () => reject(new Error('Discord gateway wait cancelled')), { once: true });
     });
     try {
+      this.log.info({ worker: this.workerId, phase }, 'Connecting to Discord gateway');
       // login() can resolve before guilds are available. Register readiness listeners first.
       // During a reconnect, let discord.js resume its existing session instead of logging in again.
       let login = Promise.resolve();
@@ -245,14 +273,21 @@ export class TeamBot<T extends string | number = number> {
         login = Promise.resolve().then(async () => {
           if (this.stopped) return;
           await client.login(this.token);
+          phase = 'client_ready';
           if (this.stopped || this.client !== client) await client.destroy();
         });
       }
-      await deadline(Promise.all([ready, login.then(checkReady)]), 30000);
+      await deadline(Promise.all([ready, login.then(checkReady)]), 30000, () => {
+        const status = Status[client.ws.status];
+        return Object.assign(new Error(`Discord gateway timed out after 30000ms during ${phase} (status: ${status})`),
+          { code: 'DISCORD_GATEWAY_TIMEOUT' });
+      });
+      this.log.info({ worker: this.workerId }, 'Discord gateway ready');
     } finally {
       client.off(Events.ClientReady, checkReady);
       client.off(Events.ShardReady, checkReady);
       client.off(Events.ShardResume, checkReady);
+      client.off(Events.ShardDisconnect, disconnected);
       abort.abort();
       if (this.gatewayAbort === abort) this.gatewayAbort = undefined;
     }
@@ -272,6 +307,7 @@ export class TeamBot<T extends string | number = number> {
         const previous = this.client;
         this.currentClient = this.createClient();
         this.gatewayStarted = false;
+        this.gatewayFailure = undefined;
         this.identified = false;
         this.gatewayReconnecting = false;
         await previous.destroy();

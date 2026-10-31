@@ -112,6 +112,17 @@ Chạy trực tiếp bằng Node.js theo hướng dẫn ở trên (`npm run buil
 
 Tham khảo: [Railpack Node.js](https://railpack.com/languages/node/), [Railway Volumes](https://docs.railway.com/volumes), [Railway deployment lifecycle](https://docs.railway.com/deployments/reference).
 
+### Khi bot bị timeout lúc khởi động
+
+`DISCORD_GATEWAY_TIMEOUT` nghĩa là worker chưa hoàn tất kết nối gateway trong 30 giây, trước bước vào voice. Log ghi rõ `login`, `client_ready` hoặc `resume` và trạng thái gateway. Đây chưa đủ để kết luận lỗi token hay mạng. Đặt `LOG_LEVEL=debug` trong Railway Variables rồi redeploy để xem bước cuối cùng trước timeout (lấy gateway URL, mở WebSocket, identify hoặc chờ guild). Mỗi worker có số `worker` trong log; sau khi chẩn đoán có thể trả về `LOG_LEVEL=info`.
+
+- `DISCORD_GATEWAY_CLOSED_4014` / `Used disallowed intents`: bật **Server Members Intent** tại Developer Portal → application tương ứng → Bot → Privileged Gateway Intents cho **từng bot**, rồi redeploy. Code cần intent này để cập nhật role leader. Xem [Discord Gateway intents](https://docs.discord.com/developers/events/gateway#privileged-intents).
+- `DISCORD_GATEWAY_CLOSED_4004` / `Authentication failed` / `TokenInvalid`: kiểm tra `BOT_TOKEN_n` của worker tương ứng trong Railway Variables.
+- `Discord REST rate limited`: xem `retryAfterMs` và log debug. Thư viện đang chờ rate limit; không restart liên tục vì sẽ tạo thêm yêu cầu đăng nhập.
+- Timeout khi lấy gateway URL hoặc mở WebSocket: kiểm tra kết nối HTTPS/WSS đi ra Discord từ container Railway. Chỉ khi có log xác nhận mới kết luận đây là lỗi mạng; nếu nhiều worker cùng lỗi, kiểm tra kết nối chung trước.
+
+`.env not found. Continuing without it.` bình thường khi cấu hình qua Railway Variables; cảnh báo npm về `production` cũng không chặn khởi động. `FFmpeg: not found` và các thư viện mã hóa tùy chọn chưa cài trong dependency report không giải thích gateway timeout. Luồng relay hiện tại encode/decode Opus trực tiếp, không dùng FFmpeg.
+
 ## Kiểm thử
 
 ```sh

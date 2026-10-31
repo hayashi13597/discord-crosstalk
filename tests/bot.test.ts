@@ -5,7 +5,7 @@ import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
 import { loadConfig } from '../src/config.js';
 import { TeamBot, type WorkerOptions } from '../src/bot.js';
 import { registerCommands } from '../src/commands.js';
-import { Events, GatewayIntentBits, type Client, type Interaction } from 'discord.js';
+import { Events, GatewayIntentBits, RESTEvents, type Client, type Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 
 const mocks = vi.hoisted(() => ({ join: vi.fn(), enter: vi.fn(), codecClosed: vi.fn() }));
@@ -24,6 +24,8 @@ vi.mock('discord.js', async importOriginal => {
     constructor(public options: unknown) { super(); }
     ready = false;
     destroyed = false;
+    rest = new EventEmitter();
+    ws = { status: original.Status.Connecting };
     user = { id: 'bot1' };
     application = { id: 'bot1' };
     users = { cache: new Map([['alice', { id: 'alice', bot: false }], ['bob', { id: 'bob', bot: false }]]) };
@@ -55,7 +57,8 @@ afterEach(async () => {
 function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options?: WorkerOptions) {
   vi.useFakeTimers();
   const router = new AudioRouter({ 1: channels[1], 2: channels[2], 3: channels[3] }, config);
-  const bot = new TeamBot(1, config, router, { info: vi.fn(), warn: vi.fn() } as unknown as Logger, onInteraction, options ?? { workerId: 1, token: config.workers[0]!.token, channelId: channels[1], active: true, onIdentity: vi.fn(async () => {}) });
+  const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
+  const bot = new TeamBot(1, config, router, log as unknown as Logger, onInteraction, options ?? { workerId: 1, token: config.workers[0]!.token, channelId: channels[1], active: true, onIdentity: vi.fn(async () => {}) });
   activeBots.push(bot);
   const voice = { channelId: channels[1], serverDeaf: false, serverMute: false };
   const members = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, {
@@ -95,7 +98,7 @@ function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options
     connection.emit('stateChange', old, connection.state);
     return connection;
   });
-  return { bot, router, states, state, members, guild, connection, subscribe, subscriptions, configureClient,
+  return { bot, log, router, states, state, members, guild, connection, subscribe, subscriptions, configureClient,
     setRole(userId: string, enabled: boolean) {
       const member = members.get(userId)!;
       if (enabled) member.roles.cache.set(config.leaderRoleId, {});
@@ -183,18 +186,61 @@ describe('Discord lifecycle', () => {
     expect(bot.status().receiving).toBe(true);
   });
   it('replaces a client that never becomes ready and retries with backoff', async () => {
-    const { bot, configureClient } = setup();
+    const { bot, log, configureClient } = setup();
     const previous = bot.client;
     vi.spyOn(previous, 'login').mockResolvedValueOnce('token');
     bot.start();
     await vi.advanceTimersByTimeAsync(30001);
     expect(previous.destroy).toHaveBeenCalled();
     expect(previous.listenerCount(Events.ClientReady)).toBe(1);
+    expect(previous.listenerCount(Events.ShardDisconnect)).toBe(1);
+    expect(bot.status().lastError).toBe('DISCORD_GATEWAY_TIMEOUT');
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({
+      err: expect.objectContaining({ message: expect.stringContaining('during client_ready') }),
+    }), 'Bot operation failed');
     expect(bot.client).not.toBe(previous);
     expect(bot.client.login).not.toHaveBeenCalled();
     configureClient();
     await vi.advanceTimersByTimeAsync(1001);
     expect(bot.status().receiving).toBe(true);
+  });
+  it('identifies a timeout while login is still pending', async () => {
+    const { bot, log } = setup();
+    vi.spyOn(bot.client, 'login').mockImplementationOnce(() => new Promise(() => {}));
+    bot.start();
+    await vi.advanceTimersByTimeAsync(30001);
+    expect(bot.status().lastError).toBe('DISCORD_GATEWAY_TIMEOUT');
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ err: expect.objectContaining({
+      message: expect.stringContaining('during login (status: Connecting)'),
+    }) }), 'Bot operation failed');
+  });
+  it.each([4004, 4013, 4014])('reports terminal gateway close %s immediately and can recover with a fresh client', async closeCode => {
+    const { bot, configureClient } = setup();
+    const previous = bot.client;
+    vi.spyOn(previous, 'login').mockResolvedValueOnce('token');
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    previous.emit(Events.ShardDisconnect, { code: closeCode, wasClean: true, reason: '' }, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(bot.status().lastError).toBe(`DISCORD_GATEWAY_CLOSED_${closeCode}`);
+    expect(previous.destroy).toHaveBeenCalledOnce();
+    expect(previous.listenerCount(Events.ShardDisconnect)).toBe(1);
+    expect(mocks.join).not.toHaveBeenCalled();
+    configureClient();
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(bot.status().receiving).toBe(true);
+    expect(bot.status().lastError).toBeNull();
+  });
+  it('reports REST rate limits without including URLs or request data', () => {
+    const { bot, log } = setup();
+    bot.client.rest.emit(RESTEvents.RateLimited, {
+      global: true, scope: 'global', retryAfter: 60000, url: 'https://example.com/secret',
+      hash: 'test', limit: 1, majorParameter: 'global', method: 'GET', route: '/gateway/bot',
+      sublimitTimeout: 0, timeToReset: 60000,
+    });
+    expect(log.warn).toHaveBeenCalledExactlyOnceWith({
+      worker: 1, global: true, scope: 'global', retryAfterMs: 60000,
+    }, 'Discord REST rate limited; waiting before retry');
   });
   it('cancels gateway readiness waits on shutdown without scheduling a retry', async () => {
     const { bot } = setup();
