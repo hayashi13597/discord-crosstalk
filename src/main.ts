@@ -72,7 +72,8 @@ async function main(): Promise<void> {
         lines.push(`${escapeMarkdown(group.name)}: ${group.state}; ${teams.length} team${runtime.groupError(group.id) ? '; lỗi AUDIO_ERROR (pause/resume để thử lại)' : ''}`);
         for (const team of teams) {
           const state = runtime.workerStatus(team.workerId);
-          lines.push(`<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${formatLeaders(state)}; relay ${!runtime.sessionRunning ? 'stopped' : group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : state?.leaderPresent ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
+          const announcers = state?.announcerIds?.length ? `; bot thông báo ${state.announcerIds.map(id => `<@${id}>`).join(', ')}` : '';
+          lines.push(`<#${team.channelId}>; Bot ${team.workerId}: ${!state ? 'thiếu BOT_TOKEN' : `gateway ${state.gateway ? 'OK' : 'offline'}; voice ${state.voice}`}; leader ${formatLeaders(state)}${announcers}; relay ${!runtime.sessionRunning ? 'stopped' : group.state === 'paused' ? 'paused' : state?.receiving ? 'sẵn sàng' : (state?.leaderPresent || state?.announcerIds?.length) ? 'chưa sẵn sàng' : 'chờ leader đúng kênh'}${state?.lastError ? `; lỗi ${state.lastError}` : ''}`);
         }
       }
       if (!groupId) {

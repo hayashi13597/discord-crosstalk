@@ -6,6 +6,7 @@ export interface Config {
   workers: { id: number; token: string }[];
   databasePath: string;
   adminRoleIds: string[];
+  announcerBotIds: string[];
   jitterMs: number;
   maxQueueMs: number;
   singleGain: number;
@@ -39,6 +40,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!databasePath || databasePath === ':memory:') throw new ConfigError('DATABASE_PATH must be a persistent file path');
   const adminRoleIds = (env.ADMIN_ROLE_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean);
   if (adminRoleIds.some(role => !snowflake.test(role))) throw new ConfigError('Invalid ADMIN_ROLE_IDS');
+  const announcerBotIds = [...new Set((env.ANNOUNCER_BOT_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean))];
+  if (announcerBotIds.some(botId => !snowflake.test(botId))) throw new ConfigError('Invalid ANNOUNCER_BOT_IDS');
   const jitterMs = number('JITTER_BUFFER_MS', 60, 0, 500);
   const maxQueueMs = number('MAX_QUEUE_MS', 200, 20, 1000);
   if (jitterMs % 20 || maxQueueMs % 20 || jitterMs >= maxQueueMs) {
@@ -47,7 +50,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const logLevel = env.LOG_LEVEL ?? 'info';
   if (!['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'].includes(logLevel)) throw new ConfigError('Invalid LOG_LEVEL');
   return {
-    guildId: id('GUILD_ID'), leaderRoleId: id('LEADER_ROLE_ID'), workers, databasePath, adminRoleIds, jitterMs, maxQueueMs,
+    guildId: id('GUILD_ID'), leaderRoleId: id('LEADER_ROLE_ID'), workers, databasePath, adminRoleIds, announcerBotIds, jitterMs, maxQueueMs,
     singleGain: number('SINGLE_SOURCE_GAIN', 1, 0, 2),
     mixGain: number('MIX_SOURCE_GAIN', 0.5, 0, 1), logLevel,
   };

@@ -1,6 +1,6 @@
 export class UserError extends Error {}
 
-export interface LeaderPresence { leaderIds: string[]; leadersKnown: boolean }
+export interface LeaderPresence { leaderIds: string[]; leadersKnown: boolean; announcerIds?: string[] }
 
 export interface RelayGroup { id: string; name: string; state: 'active' | 'paused'; legacy: boolean }
 export interface RelayTeam {

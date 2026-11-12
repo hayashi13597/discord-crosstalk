@@ -1,6 +1,7 @@
 import type { Interaction } from 'discord.js';
 import type { Logger } from 'pino';
 import { AudioRouter } from './audio/router.js';
+import { BroadcastHub } from './audio/broadcast.js';
 import { TeamBot, type BotStatus } from './bot.js';
 import type { Config } from './config.js';
 import type { RelayGroup, RelaySnapshot } from './types.js';
@@ -11,6 +12,8 @@ export class RelayRuntime {
   private groups = new Map<string, GroupRuntime>();
   private errors = new Map<string, string>();
   private workers = new Map<number, TeamBot<string>>();
+  private workerUserIds = new Set<string>();
+  private broadcast = new BroadcastHub<string>();
   private snapshot: RelaySnapshot = { groups: [], teams: [] };
   private idle: AudioRouter<string>;
   private stopped = false;
@@ -28,7 +31,14 @@ export class RelayRuntime {
     for (const worker of config.workers) {
       this.workers.set(worker.id, new TeamBot(`idle-${worker.id}`, config, this.idle, log,
         worker.id === 1 ? onInteraction : undefined,
-        { workerId: worker.id, token: worker.token, channelId: null, active: false, onIdentity: userId => identify(worker.id, userId) }));
+        {
+          workerId: worker.id, token: worker.token, channelId: null, active: false,
+          broadcast: this.broadcast, workerUserIds: this.workerUserIds,
+          onIdentity: async userId => {
+            await identify(worker.id, userId);
+            this.workerUserIds.add(userId);
+          },
+        }));
     }
   }
 
@@ -51,6 +61,7 @@ export class RelayRuntime {
         for (const team of old.teams.filter(team => team.groupId === id)) {
           this.workers.get(team.workerId)?.configure(`idle-${team.workerId}`, this.idle, null, false);
         }
+        this.broadcast.detachRouter(id);
         this.groups.get(id)?.router.stop();
         this.groups.delete(id);
         this.errors.delete(id);
@@ -61,7 +72,10 @@ export class RelayRuntime {
           error => this.contain(id, error, old));
         this.groups.set(id, { signature: signature(group), router });
         for (const team of teams) this.workers.get(team.workerId)?.configure(team.id, router, team.channelId, this.session && group.state === 'active');
-        if (this.session && group.state === 'active') router.start();
+        if (this.session && group.state === 'active') {
+          this.broadcast.attachRouter(id, router);
+          router.start();
+        }
       } catch (error) { this.contain(id, error, old); }
     }
     // Metadata updates leave connections, timers and other groups intact.
@@ -75,6 +89,7 @@ export class RelayRuntime {
   private contain(id: string, error: unknown, previous: RelaySnapshot): void {
     this.errors.set(id, 'AUDIO_ERROR');
     this.log.error({ group: id, err: error }, 'Relay group failed; other groups continue');
+    this.broadcast.detachRouter(id);
     this.groups.get(id)?.router.stop();
     const workers = new Set([...previous.teams, ...this.snapshot.teams].filter(team => {
       if (team.groupId !== id) return false;
@@ -94,6 +109,7 @@ export class RelayRuntime {
   async stop(): Promise<void> {
     this.stopped = true;
     const closing = [...this.workers.values()].map(worker => worker.stop());
+    this.broadcast.clear();
     for (const group of this.groups.values()) group.router.stop();
     this.idle.stop();
     await Promise.allSettled(closing);

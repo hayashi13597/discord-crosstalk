@@ -4,10 +4,14 @@ import { RelayRuntime } from '../src/runtime.js';
 import { loadConfig } from '../src/config.js';
 import type { RelaySnapshot } from '../src/types.js';
 
-const mocks = vi.hoisted(() => ({ workers: new Map<number, { configure: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> }>() }));
+const mocks = vi.hoisted(() => ({ workers: new Map<number, { configure: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; options: { broadcast?: { begin: (team: string, userId: string) => string | undefined; end: (key: string) => void } } }>() }));
 vi.mock('../src/bot.js', () => ({ TeamBot: class {
   configure = vi.fn(); refresh = vi.fn(); start = vi.fn(); stop = vi.fn(async () => {}); status = vi.fn(() => ({}));
-  constructor(...args: unknown[]) { mocks.workers.set((args[5] as { workerId: number }).workerId, this); }
+  options: { broadcast?: { begin: (team: string, userId: string) => string | undefined; end: (key: string) => void } };
+  constructor(...args: unknown[]) {
+    this.options = args[5] as typeof this.options;
+    mocks.workers.set((args[5] as { workerId: number }).workerId, this);
+  }
 } }));
 const config = loadConfig({
   GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c', BOT_TOKEN_4: 'd', BOT_TOKEN_5: 'e', BOT_TOKEN_6: 'f',
@@ -134,5 +138,26 @@ describe('group runtime reconciliation', () => {
     await runtime.stop();
     expect(vi.getTimerCount()).toBe(0);
     for (const worker of mocks.workers.values()) expect(worker.stop).toHaveBeenCalledOnce();
+  });
+  it('shares a BroadcastHub across active groups and detaches paused groups without extra timers', () => {
+    const { runtime, snapshot } = setup();
+    const broadcast = mocks.workers.get(1)!.options.broadcast!;
+    const routerA = mocks.workers.get(1)!.configure.mock.calls.at(-1)?.[1] ?? undefined;
+    expect(routerA).toBeUndefined(); // setup cleared mocks after initial apply
+    const key = broadcast.begin('team-1', 'announcer-1')!;
+    expect(key).toBeDefined();
+
+    snapshot.groups[1]!.state = 'paused';
+    runtime.apply(snapshot);
+    const routerBPaused = mocks.workers.get(4)!.configure.mock.calls.at(-1)![1];
+    expect(routerBPaused.hasBroadcast(key)).toBe(false);
+
+    snapshot.groups[1]!.state = 'active';
+    runtime.apply(snapshot);
+    const routerBActive = mocks.workers.get(4)!.configure.mock.calls.at(-1)![1];
+    expect(routerBActive.hasBroadcast(key)).toBe(true);
+    expect(vi.getTimerCount()).toBe(2);
+    broadcast.end(key);
+    expect(routerBActive.hasBroadcast(key)).toBe(false);
   });
 });
