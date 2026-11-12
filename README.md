@@ -38,6 +38,7 @@ Chọn group từ autocomplete. Worker trống được cấp theo ID tăng dầ
 - Cho bot **View Channel**, **Connect**, **Speak** tại channel được phân công, chừa chỗ nếu channel giới hạn người. Dùng regular voice channel, không dùng Stage.
 - Bật **Server Members Intent** cho từng application, kể cả bot idle. Không cần Message Content hoặc Administrator; không server mute/deafen bot.
 - Tạo role Leader, đặt Role ID vào `LEADER_ROLE_ID` và gán role cho người cần relay. Không dùng @everyone. Leader được xác định lại từ role và voice channel, hỗ trợ nhiều leader/team.
+- Tùy chọn `ANNOUNCER_BOT_IDS` (danh sách User ID phân tách bằng dấu phẩy): khi một bot ngoài hệ thống nằm trong danh sách này vào voice channel có worker đang hoạt động, audio của bot đó được phát **1 chiều** tới tất cả các team đang active trên mọi group (không phát ngược về channel nguồn và không truyền ngược lại giữa các group).
 
 ## Slash commands
 

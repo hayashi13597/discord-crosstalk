@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { AudioRouter, FrameQueue, FRAME_BYTES, mixFrames, type Output } from '../src/audio/router.js';
+import { BroadcastHub } from '../src/audio/broadcast.js';
 import { createCodec } from '../src/audio/codec.js';
 import { LatestPacketStream, VoiceOutput } from '../src/audio/output.js';
 const TEAMS = [1, 2, 3] as const;
@@ -474,5 +475,82 @@ describe('independent relay groups', () => {
     vi.advanceTimersByTime(20);
     expect(fault).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('cross-group announcer broadcast', () => {
+  const createGroup = (prefix: string) => {
+    const ids = [1, 2, 3].map(n => `${prefix}${n}`);
+    const router = new AudioRouter<string>(Object.fromEntries(ids.map(id => [id, `channel-${id}`])), { jitterMs: 0, maxQueueMs: 200, singleGain: 1, mixGain: 0.5 }, () => 0);
+    const outputs = new Map(ids.map(id => [id, { write: vi.fn<Output['write']>(), reset: vi.fn(), setReady: vi.fn<(ready: boolean) => void>(), close: vi.fn() }]));
+    for (const id of ids) { router.attach(id, outputs.get(id)!); router.setTransport(id, true); }
+    router.setLeaders(Object.fromEntries(ids.map(id => [id, [`leader-${id}`]])));
+    return { ids, router, outputs };
+  };
+
+  it('broadcasts one-way across active groups without echoing back to source team or leaking group leaders', () => {
+    const hub = new BroadcastHub<string>();
+    const a = createGroup('a');
+    const b = createGroup('b');
+    hub.attachRouter('a', a.router);
+    hub.attachRouter('b', b.router);
+
+    const key = hub.begin('a1', 'announcer-1');
+    hub.push(key, pcm(1200));
+    const bLeader = b.router.beginSource('b2', 'leader-b2', 'channel-b2', false)!;
+    b.router.push('b2', bLeader, pcm(400));
+
+    a.router.tick();
+    b.router.tick();
+
+    // Source team a1 receives neither its own announcer nor Group B's leader.
+    expect(a.outputs.get('a1')!.write.mock.calls.at(-1)![0]).toBeUndefined();
+    expect(a.outputs.get('a2')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(1200);
+    expect(a.outputs.get('a3')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(1200);
+
+    // Group B receives the announcer mixed with Group B's leader (without self-echo on b2).
+    expect(b.outputs.get('b1')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(800);
+    expect(b.outputs.get('b2')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(1200);
+    expect(b.outputs.get('b3')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(800);
+  });
+
+  it('registers active broadcasts onto newly attached group routers and revokes cleanly on end', () => {
+    const hub = new BroadcastHub<string>();
+    const a = createGroup('a');
+    const b = createGroup('b');
+    hub.attachRouter('a', a.router);
+    const key = hub.begin('a1', 'announcer-1');
+
+    hub.attachRouter('b', b.router);
+    hub.push(key, pcm(1000));
+    a.router.tick();
+    b.router.tick();
+    expect(b.outputs.get('b1')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(1000);
+
+    for (const out of [...a.outputs.values(), ...b.outputs.values()]) out.reset.mockClear();
+    hub.end(key);
+    expect(a.outputs.get('a1')!.reset).not.toHaveBeenCalled();
+    expect(a.outputs.get('a2')!.reset).toHaveBeenCalledOnce();
+    expect(b.outputs.get('b1')!.reset).toHaveBeenCalledOnce();
+
+    hub.push(key, pcm(2000));
+    b.router.tick();
+    expect(b.outputs.get('b1')!.write.mock.calls.at(-1)![0]).toBeUndefined();
+  });
+
+  it('stops receiving broadcasts after a group router detaches', () => {
+    const hub = new BroadcastHub<string>();
+    const a = createGroup('a');
+    const b = createGroup('b');
+    hub.attachRouter('a', a.router);
+    hub.attachRouter('b', b.router);
+    const key = hub.begin('a1', 'announcer-1');
+
+    hub.detachRouter('b');
+    hub.push(key, pcm(1500));
+    a.router.tick();
+    b.router.tick();
+    expect(a.outputs.get('a2')!.write.mock.calls.at(-1)![0]!.readInt16LE()).toBe(1500);
+    expect(b.outputs.get('b1')!.write.mock.calls.at(-1)![0]).toBeUndefined();
   });
 });

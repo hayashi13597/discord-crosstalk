@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AudioRouter, FRAME_BYTES } from '../src/audio/router.js';
+import { BroadcastHub } from '../src/audio/broadcast.js';
 import { loadConfig } from '../src/config.js';
 import { TeamBot, type WorkerOptions } from '../src/bot.js';
 import { registerCommands } from '../src/commands.js';
@@ -54,11 +55,11 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options?: WorkerOptions) {
+function setup(onInteraction?: ConstructorParameters<typeof TeamBot>[4], options?: WorkerOptions, customConfig = config) {
   vi.useFakeTimers();
-  const router = new AudioRouter({ 1: channels[1], 2: channels[2], 3: channels[3] }, config);
+  const router = new AudioRouter({ 1: channels[1], 2: channels[2], 3: channels[3] }, customConfig);
   const log = { info: vi.fn(), warn: vi.fn(), debug: vi.fn() };
-  const bot = new TeamBot(1, config, router, log as unknown as Logger, onInteraction, options ?? { workerId: 1, token: config.workers[0]!.token, channelId: channels[1], active: true, onIdentity: vi.fn(async () => {}) });
+  const bot = new TeamBot(1, customConfig, router, log as unknown as Logger, onInteraction, options ?? { workerId: 1, token: customConfig.workers[0]!.token, channelId: channels[1], active: true, onIdentity: vi.fn(async () => {}) });
   activeBots.push(bot);
   const voice = { channelId: channels[1], serverDeaf: false, serverMute: false };
   const members = new Map(['alice', 'bob', 'relay-bot'].map(id => [id, {
@@ -558,5 +559,84 @@ describe('dynamic worker assignments', () => {
     connection.emit('error', new Error('late error'));
     expect(bot.status().lastError).toBeNull();
     expect(bot.status().gateway).toBe(true);
+  });
+});
+
+describe('announcer bot capture', () => {
+  const announcerId = '223456789012345681';
+  const announcerConfig = loadConfig({
+    GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
+    ANNOUNCER_BOT_IDS: announcerId, JITTER_BUFFER_MS: '0',
+  });
+
+  it('captures a whitelisted external bot without leader role and pushes PCM through BroadcastHub', async () => {
+    const hub = new BroadcastHub<number>();
+    const workerUserIds = new Set<string>(['bot2']);
+    const otherRouter = new AudioRouter({ 2: channels[2] }, announcerConfig, () => 0);
+    const otherOutput = { write: vi.fn(), reset: vi.fn(), setReady: vi.fn(), close: vi.fn() };
+    otherRouter.attach(2, otherOutput);
+    otherRouter.setTransport(2, true);
+    hub.attachRouter('other', otherRouter);
+
+    const { bot, router, members, states, state, subscribe, subscriptions } = setup(
+      undefined,
+      { workerId: 1, token: 'a', channelId: channels[1], active: true, broadcast: hub, workerUserIds, onIdentity: vi.fn(async () => {}) },
+      announcerConfig,
+    );
+    hub.attachRouter('main', router);
+    // Remove alice's leader role so only the announcer bot is active in channel 1.
+    members.get('alice')!.roles.cache.clear();
+    members.set(announcerId, {
+      id: announcerId, user: { bot: true }, guild: { id: announcerConfig.guildId },
+      voice: { channelId: channels[1] }, roles: { cache: new Map() },
+    });
+    states.set(announcerId, state(announcerId));
+
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribe).toHaveBeenCalledExactlyOnceWith(announcerId, expect.anything());
+    expect(bot.status()).toMatchObject({ leaderIds: [], leaderPresent: false, announcerIds: [announcerId], receiving: true });
+
+    subscriptions.get(announcerId)!.write(Buffer.from([1, 2, 3]));
+    otherRouter.tick();
+    expect(otherOutput.write).toHaveBeenCalled();
+    expect(otherOutput.write.mock.calls.at(-1)![0]).toBeInstanceOf(Buffer);
+
+    // Leaving voice revokes the broadcast stream immediately.
+    states.delete(announcerId);
+    bot.client.emit(Events.VoiceStateUpdate, state(announcerId) as never, { id: announcerId, channelId: null, guild: { id: announcerConfig.guildId } } as never);
+    expect(bot.status().receiving).toBe(false);
+    expect(bot.status().announcerIds).toBeUndefined();
+    expect(otherOutput.reset).toHaveBeenCalled();
+  });
+
+  it('ignores non-whitelisted bots and CrossTalk worker bots even if listed in ANNOUNCER_BOT_IDS', async () => {
+    const workerId = '323456789012345682';
+    const selfId = '423456789012345683';
+    const otherBotId = '523456789012345684';
+    const guardedConfig = loadConfig({
+      GUILD_ID: '123456789012345678', LEADER_ROLE_ID: '123456789012345680', BOT_TOKEN_1: 'a', BOT_TOKEN_2: 'b', BOT_TOKEN_3: 'c',
+      ANNOUNCER_BOT_IDS: `${workerId},${selfId}`,
+    });
+    const workerUserIds = new Set<string>([workerId]);
+    const { bot, members, states, state, subscribe } = setup(
+      undefined,
+      { workerId: 1, token: 'a', channelId: channels[1], active: true, workerUserIds, onIdentity: vi.fn(async () => {}) },
+      guardedConfig,
+    );
+    bot.client.user = { id: selfId } as never;
+    members.get('alice')!.roles.cache.clear();
+    for (const id of [workerId, selfId, otherBotId]) {
+      members.set(id, {
+        id, user: { bot: true }, guild: { id: guardedConfig.guildId },
+        voice: { channelId: channels[1] }, roles: { cache: new Map() },
+      });
+      states.set(id, state(id));
+    }
+
+    bot.start();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(bot.status().receiving).toBe(false);
   });
 });

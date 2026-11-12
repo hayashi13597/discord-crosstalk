@@ -8,12 +8,16 @@ export const validEnv = {
 };
 describe('configuration', () => {
   it('uses low latency defaults', () => {
-    expect(loadConfig(validEnv)).toMatchObject({ jitterMs: 60, maxQueueMs: 200, singleGain: 1, mixGain: 0.5, adminRoleIds: [], leaderRoleId: validEnv.LEADER_ROLE_ID });
+    expect(loadConfig(validEnv)).toMatchObject({ jitterMs: 60, maxQueueMs: 200, singleGain: 1, mixGain: 0.5, adminRoleIds: [], announcerBotIds: [], leaderRoleId: validEnv.LEADER_ROLE_ID });
+  });
+  it('parses and deduplicates ANNOUNCER_BOT_IDS', () => {
+    const config = loadConfig({ ...validEnv, ANNOUNCER_BOT_IDS: ' 123456789012345681 , 123456789012345682,123456789012345681 ' });
+    expect(config.announcerBotIds).toEqual(['123456789012345681', '123456789012345682']);
   });
   it.each([
     { BOT_TOKEN_1: '' }, { BOT_TOKEN_1: validEnv.BOT_TOKEN_2 }, { DATABASE_PATH: '' },
     { GUILD_ID: 'invalid' }, { DATABASE_PATH: ':memory:' }, { JITTER_BUFFER_MS: '45' }, { MAX_QUEUE_MS: '60' },
-    { LEADER_ROLE_ID: undefined }, { LEADER_ROLE_ID: '' }, { LEADER_ROLE_ID: 'invalid' }, { MIX_SOURCE_GAIN: 'NaN' }, { ADMIN_ROLE_IDS: 'invalid' },
+    { LEADER_ROLE_ID: undefined }, { LEADER_ROLE_ID: '' }, { LEADER_ROLE_ID: 'invalid' }, { MIX_SOURCE_GAIN: 'NaN' }, { ADMIN_ROLE_IDS: 'invalid' }, { ANNOUNCER_BOT_IDS: 'invalid' },
   ])('rejects invalid config %j with safe ConfigError message', override => {
     let caught: unknown;
     try { loadConfig({ ...validEnv, ...override }); }

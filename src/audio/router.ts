@@ -71,13 +71,16 @@ export function mixFrames(frames: Buffer[], singleGain: number, mixGain: number)
   return output;
 }
 
-interface Source { userId: string; epoch: number; queue: FrameQueue; remainder: Buffer }
+interface QueuedAudio { queue: FrameQueue; remainder: Buffer }
+interface Source extends QueuedAudio { userId: string; epoch: number }
+interface BroadcastSource<T> extends QueuedAudio { key: string; sourceTeam: T }
 
 export class AudioRouter<T extends string | number = number> {
   private teamIds: T[];
   private leaders = new Map<T, Set<string>>();
   private available = new Set<T>();
   private sources = new Map<T, Map<number, Source>>();
+  private broadcasts = new Map<string, BroadcastSource<T>>();
   private epochs = new Map<T, number>();
   private outputs = new Map<T, Output>();
   private timer?: NodeJS.Timeout;
@@ -146,19 +149,44 @@ export class AudioRouter<T extends string | number = number> {
     for (const dest of this.teamIds) if (dest !== team) this.outputs.get(dest)?.reset();
   }
 
+  beginBroadcast(key: string, sourceTeam: T): void {
+    if (this.broadcasts.has(key)) return;
+    this.broadcasts.set(key, {
+      key, sourceTeam, queue: new FrameQueue(this.settings.jitterMs, this.settings.maxQueueMs), remainder: Buffer.alloc(0),
+    });
+  }
+
+  hasBroadcast(key: string): boolean { return this.broadcasts.has(key); }
+
+  pushBroadcast(key: string, pcm: Buffer): void {
+    const broadcast = this.broadcasts.get(key);
+    if (!broadcast) return;
+    this.enqueuePcm(broadcast, pcm);
+  }
+
+  endBroadcast(key: string): void {
+    const broadcast = this.broadcasts.get(key);
+    if (!broadcast) return;
+    this.broadcasts.delete(key);
+    for (const dest of this.teamIds) if (dest !== broadcast.sourceTeam) this.outputs.get(dest)?.reset();
+  }
+
   push(team: T, epoch: number, pcm: Buffer): void {
     if (!this.isCurrent(team, epoch)) return;
-    const source = this.sources.get(team)!.get(epoch)!;
+    this.enqueuePcm(this.sources.get(team)!.get(epoch)!, pcm);
+  }
+
+  private enqueuePcm(target: QueuedAudio, pcm: Buffer): void {
     // Opus can decode several frames per packet. Keep only a partial frame as remainder.
     if (pcm.length > FRAME_BYTES * 6 || pcm.length % (CHANNELS * 2)) return;
-    const combined = source.remainder.length ? Buffer.concat([source.remainder, pcm]) : pcm;
+    const combined = target.remainder.length ? Buffer.concat([target.remainder, pcm]) : pcm;
     const now = this.clock();
     let offset = 0;
     while (offset + FRAME_BYTES <= combined.length) {
-      source.queue.push(combined.subarray(offset, offset + FRAME_BYTES), now);
+      target.queue.push(combined.subarray(offset, offset + FRAME_BYTES), now);
       offset += FRAME_BYTES;
     }
-    source.remainder = Buffer.from(combined.subarray(offset));
+    target.remainder = Buffer.from(combined.subarray(offset));
   }
 
   tick(): void {
@@ -166,6 +194,9 @@ export class AudioRouter<T extends string | number = number> {
     if (this.lastTick !== undefined && now - this.lastTick > this.settings.maxQueueMs) {
       for (const sources of this.sources.values()) for (const source of sources.values()) {
         source.queue.clear(); source.remainder = Buffer.alloc(0);
+      }
+      for (const broadcast of this.broadcasts.values()) {
+        broadcast.queue.clear(); broadcast.remainder = Buffer.alloc(0);
       }
       for (const output of this.outputs.values()) output.reset();
     }
@@ -177,6 +208,13 @@ export class AudioRouter<T extends string | number = number> {
       if (frame) {
         frames.push([team, frame]);
         activeTeams.add(team);
+      }
+    }
+    for (const broadcast of this.broadcasts.values()) {
+      const frame = broadcast.queue.take(now);
+      if (frame) {
+        frames.push([broadcast.sourceTeam, frame]);
+        activeTeams.add(broadcast.sourceTeam);
       }
     }
     if (!frames.length) {
@@ -231,6 +269,7 @@ export class AudioRouter<T extends string | number = number> {
     clearTimeout(this.timer);
     this.timer = undefined;
     this.sources.clear();
+    this.broadcasts.clear();
     this.available.clear();
     this.lastTick = undefined;
     let failure: unknown;

@@ -5,6 +5,7 @@ import type { Logger } from 'pino';
 import type { Config } from './config.js';
 import { createCodec, type Codec } from './audio/codec.js';
 import { AudioRouter } from './audio/router.js';
+import type { BroadcastSink } from './audio/broadcast.js';
 import { VoiceOutput } from './audio/output.js';
 import { registerCommands } from './commands.js';
 import { safeError } from './logger.js';
@@ -20,7 +21,9 @@ export interface BotStatus<T = number> extends LeaderPresence {
   receiving: boolean;
   lastError: string | null;
 }
-interface Capture { userId: string; epoch: number; stream: AudioReceiveStream; codec: Codec }
+type Capture =
+  | { kind: 'leader'; userId: string; epoch: number; stream: AudioReceiveStream; codec: Codec }
+  | { kind: 'announcer'; userId: string; key: string; stream: AudioReceiveStream; codec: Codec };
 
 export function retryDelay(attempt: number, random = Math.random): number {
   return Math.round(Math.min(30000, 1000 * 2 ** Math.min(attempt, 5)) * (0.8 + 0.2 * random()));
@@ -43,12 +46,14 @@ function gatewayCloseError(code: number): Error {
   return Object.assign(new Error(message), { code: `DISCORD_GATEWAY_CLOSED_${code}` });
 }
 
-export interface WorkerOptions {
+export interface WorkerOptions<T extends string | number = number> {
   workerId: number;
   token: string;
   channelId: string | null;
   active: boolean;
   onIdentity: (userId: string) => Promise<void>;
+  broadcast?: BroadcastSink<T>;
+  workerUserIds?: ReadonlySet<string>;
 }
 
 const workerCacheFactory = Options.cacheWithLimits({
@@ -99,6 +104,18 @@ export class TeamBot<T extends string | number = number> {
 
   private revision = 0;
   private identified = false;
+  private broadcastSeq = 0;
+  private readonly fallbackBroadcast: BroadcastSink<T> = {
+    begin: (sourceTeam, userId) => {
+      const key = `${String(sourceTeam)}:${userId}:${++this.broadcastSeq}`;
+      this.router.beginBroadcast(key, sourceTeam);
+      return key;
+    },
+    isCurrent: key => this.router.hasBroadcast(key),
+    push: (key, pcm) => this.router.pushBroadcast(key, pcm),
+    end: key => this.router.endBroadcast(key),
+  };
+  private broadcastSink(): BroadcastSink<T> { return this.options.broadcast ?? this.fallbackBroadcast; }
   private get workerId(): number { return this.options.workerId; }
   private get token(): string { return this.options.token; }
   private get channelId(): string | null { return this.options.channelId; }
@@ -106,7 +123,7 @@ export class TeamBot<T extends string | number = number> {
 
   constructor(public team: T, private config: Config, private router: AudioRouter<T>,
     private log: Logger,
-    private onInteraction: ((interaction: Interaction) => void) | undefined, private options: WorkerOptions) {
+    private onInteraction: ((interaction: Interaction) => void) | undefined, private options: WorkerOptions<T>) {
     this.currentClient = this.createClient();
     this.output = new VoiceOutput(error => this.audioFault(error));
     if (this.channelId) router.attach(team, this.output);
@@ -416,6 +433,25 @@ export class TeamBot<T extends string | number = number> {
     }).map(voice => voice.id).sort();
   }
 
+  private eligibleAnnouncerIds(): string[] {
+    if (!this.channelId || !this.membersReady || !this.gatewayReady() || !this.config.announcerBotIds.length) return [];
+    const guild = this.client.guilds.cache.get(this.config.guildId);
+    if (!guild) return [];
+    const allowed = new Set(this.config.announcerBotIds);
+    return [...guild.voiceStates.cache.values()].filter(voice => {
+      if (voice.channelId !== this.channelId) return false;
+      if (voice.id === this.client.user?.id || this.options.workerUserIds?.has(voice.id)) return false;
+      const member = guild.members.cache.get(voice.id);
+      return Boolean(member && member.user.bot && allowed.has(voice.id));
+    }).map(voice => voice.id).sort();
+  }
+
+  private isCaptureCurrent(capture: Capture): boolean {
+    return capture.kind === 'leader'
+      ? this.router.isCurrent(this.team, capture.epoch)
+      : this.broadcastSink().isCurrent(capture.key);
+  }
+
   refresh(): void {
     if (this.stopped) return;
     const guild = this.client.guilds.cache.get(this.config.guildId);
@@ -424,29 +460,49 @@ export class TeamBot<T extends string | number = number> {
       ownVoice?.channelId === this.channelId && !ownVoice.serverDeaf && !ownVoice.serverMute;
     this.router.setTransport(this.team, Boolean(ready));
     const leaderIds = ready ? this.eligibleLeaderIds() : [];
+    const announcerIds = ready ? this.eligibleAnnouncerIds() : [];
     this.router.setTeamLeaders(this.team, leaderIds);
-    for (const userId of this.captures.keys()) if (!leaderIds.includes(userId)) this.stopCapture(userId);
-    for (const userId of leaderIds) this.startCapture(userId);
+    const desired = new Map<string, 'leader' | 'announcer'>([
+      ...leaderIds.map(id => [id, 'leader'] as const),
+      ...announcerIds.map(id => [id, 'announcer'] as const),
+    ]);
+    for (const [userId, capture] of this.captures) {
+      if (desired.get(userId) !== capture.kind) this.stopCapture(userId);
+    }
+    for (const [userId, kind] of desired) this.startCapture(userId, kind);
   }
 
-  private startCapture(userId: string): void {
+  private startCapture(userId: string, kind: 'leader' | 'announcer'): void {
     const current = this.captures.get(userId);
-    if (current && this.router.isCurrent(this.team, current.epoch)) return;
+    if (current && current.kind === kind && this.isCaptureCurrent(current)) return;
     this.stopCapture(userId);
     // A destroyed receive stream remains in the receiver map until its asynchronous close event.
     if (this.connection!.receiver.subscriptions.get(userId)?.destroyed) { this.schedule(1000); return; }
-    const epoch = this.router.beginSource(this.team, userId, this.channelId, false);
-    if (epoch === undefined) return;
+    let epoch: number | undefined;
+    let key: string | undefined;
+    if (kind === 'leader') {
+      epoch = this.router.beginSource(this.team, userId, this.channelId, false);
+      if (epoch === undefined) return;
+    } else {
+      key = this.broadcastSink().begin(this.team, userId);
+      if (key === undefined) return;
+    }
     try {
       const codec = createCodec();
       let stream: AudioReceiveStream;
       try { stream = this.connection!.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } }); }
       catch (error) { codec.close(); throw error; }
-      const capture: Capture = { userId, epoch, stream, codec };
+      const capture: Capture = kind === 'leader'
+        ? { kind: 'leader', userId, epoch: epoch!, stream, codec }
+        : { kind: 'announcer', userId, key: key!, stream, codec };
       this.captures.set(userId, capture);
       stream.on('data', (packet: Buffer) => {
-        if (this.captures.get(userId) !== capture || !this.router.isCurrent(this.team, epoch)) return;
-        try { this.router.push(this.team, epoch, codec.decode(packet)); }
+        if (this.captures.get(userId) !== capture || !this.isCaptureCurrent(capture)) return;
+        try {
+          const pcm = codec.decode(packet);
+          if (capture.kind === 'leader') this.router.push(this.team, capture.epoch, pcm);
+          else this.broadcastSink().push(capture.key, pcm);
+        }
         catch (error) { this.captureFault(capture, error); }
       });
       stream.on('error', error => this.captureFault(capture, error));
@@ -454,7 +510,8 @@ export class TeamBot<T extends string | number = number> {
         if (this.captures.get(userId) === capture) { this.stopCapture(userId); this.schedule(1000); }
       });
     } catch (error) {
-      this.router.endSource(this.team, epoch);
+      if (kind === 'leader') this.router.endSource(this.team, epoch!);
+      else this.broadcastSink().end(key!);
       this.recordError(error);
       this.schedule(1000);
     }
@@ -476,7 +533,8 @@ export class TeamBot<T extends string | number = number> {
     const capture = this.captures.get(userId);
     this.captures.delete(userId);
     if (!capture) return;
-    this.router.endSource(this.team, capture.epoch);
+    if (capture.kind === 'leader') this.router.endSource(this.team, capture.epoch);
+    else this.broadcastSink().end(capture.key);
     capture.stream.destroy();
     capture.codec.close();
   }
@@ -506,11 +564,13 @@ export class TeamBot<T extends string | number = number> {
   status(): BotStatus<T> {
     const guild = this.client.guilds.cache.get(this.config.guildId);
     const leaderIds = this.eligibleLeaderIds();
+    const announcerIds = this.eligibleAnnouncerIds();
     return {
       team: this.team, gateway: this.gatewayReady(), voice: this.connection?.state.status ?? 'offline',
       channelId: guild?.members.me?.voice.channelId ?? null,
       leaderIds, leadersKnown: this.membersReady && this.gatewayReady(), leaderPresent: leaderIds.length > 0,
-      receiving: [...this.captures.values()].some(capture => this.router.isCurrent(this.team, capture.epoch)), lastError: this.lastError,
+      ...(announcerIds.length ? { announcerIds } : {}),
+      receiving: [...this.captures.values()].some(capture => this.isCaptureCurrent(capture)), lastError: this.lastError,
     };
   }
 
